@@ -298,10 +298,6 @@ jobs:
               packaging/service.sh > "$PKG/service.sh"
           cp packaging/uninstall.sh "$PKG/uninstall.sh"
           cp packaging/action.sh "$PKG/action.sh"
-
-          # Load dependencies in exact order
-          sed -i '/for m in "\$KMOD"\/mac80211\.ko/,/done/c\for m in "$KMOD"/mac80211.ko \\\n         "$KMOD"/rtw_core.ko \\\n         "$KMOD"/rtw_8723x.ko \\\n         "$KMOD"/rtw_8723d.ko \\\n         "$KMOD"/rtw_usb.ko \\\n         "$KMOD"/rtw_8723du.ko ; do\n  [ -e "$m" ] || continue\n  base=$(basename "$m" .ko); lsn=$(echo "$base" | tr "-" "_")\n  lsmod | grep -q "^$lsn " && continue\n  insmod "$m" 2>/dev/null && log "loaded $base"\ndone' "$PKG/service.sh"
-
           chmod 755 "$PKG/service.sh" "$PKG/uninstall.sh" "$PKG/action.sh"
 
           # Official Magisk/KernelSU/APatch installer shim
