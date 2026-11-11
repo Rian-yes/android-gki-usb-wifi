@@ -56,8 +56,11 @@ jobs:
 
       - name: Install deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bc bison flex libssl-dev libelf-dev \
+          # Replace flaky azure mirror with canonical archive.ubuntu.com
+          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/sources.list 2>/dev/null || true
+          for i in 1 2 3; do sudo apt-get update && break || sleep 5; done
+          sudo apt-get install -y -o Acquire::Retries=5 --fix-missing \
+            bc bison flex libssl-dev libelf-dev \
             lz4 cpio kmod git curl zip file dwarves
           pahole --version
 
