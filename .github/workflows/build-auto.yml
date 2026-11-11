@@ -288,15 +288,13 @@ jobs:
           sed -i 's/u8 \*buf_star;/u8 *buf_star = NULL;/' include/rtw_recv.h 2>/dev/null || true
           sed -i 's/.*sign-file.*/# disabled sign-file/' Makefile 2>/dev/null || true
 
-          # Most rtl88xxau Makefiles accept KSRC + cross vars
+          CURDIR="$(pwd)"
           make -j$(nproc) \
             KSRC="$GITHUB_WORKSPACE/ks/out" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 CC=clang LD=ld.lld \
-            KCFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough" \
-            USER_EXTRA_CFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough" \
-            EXTRA_CFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough"
+            USER_EXTRA_CFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough -I$CURDIR/include -I$CURDIR/platform -I$CURDIR/hal"
           KO_COUNT=$(find . -name "*.ko" | wc -l)
           if [ "$KO_COUNT" -eq 0 ]; then
             echo "::error::Out-of-tree driver build failed to produce any .ko files!"

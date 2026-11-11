@@ -193,14 +193,13 @@ jobs:
           sed -i 's/.*sign-file.*/# disabled sign-file/' Makefile 2>/dev/null || true
 
           echo "Building RTL8723DU against prepared kernel..."
+          CURDIR="$(pwd)"
           make -j$(nproc) \
             KSRC="$GITHUB_WORKSPACE/ks/out" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 CC=clang LD=ld.lld \
-            KCFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough" \
-            USER_EXTRA_CFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough" \
-            EXTRA_CFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough"
+            USER_EXTRA_CFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough -I$CURDIR/include -I$CURDIR/platform -I$CURDIR/hal"
 
           KO_COUNT=$(find . -name "*.ko" | wc -l)
           if [ "$KO_COUNT" -eq 0 ]; then
