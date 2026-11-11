@@ -35,8 +35,7 @@ for f in /vendor/firmware/*; do
 done
 chmod -R 755 "$FWDIR"
 chcon -R -h u:object_r:vendor_fw_file:s0 "$FWDIR" 2>/dev/null
-echo "$FWDIR" > /sys/module/firmware_class/parameters/path 2>/dev/null
-log "firmware staged at $FWDIR with vendor symlinks"
+log "firmware staged at $FWDIR"
 
 # 3) Prevent memory fragmentation for mac80211 queue allocation (native kernel VM tuning)
 sysctl -w vm.compaction_proactiveness=50 2>/dev/null || true
