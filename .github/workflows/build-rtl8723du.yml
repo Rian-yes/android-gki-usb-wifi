@@ -180,13 +180,16 @@ jobs:
           git clone --depth 1 "$OOT_REPO" oot
           cd oot
 
+          echo "Applying 5.15 compatibility patches..."
+          # device_get_mac_address was added in kernel 5.17+; fallback to random MAC on 5.15
+          sed -i 's/device_get_mac_address([^)]*)/1/g' main.c 2>/dev/null || true
+
           echo "Building RTW88 against prepared kernel..."
           make -j$(nproc) \
             KSRC="$GITHUB_WORKSPACE/ks/out" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 CC=clang LD=ld.lld
-
           KO_COUNT=$(find . -name "*.ko" | wc -l)
           if [ "$KO_COUNT" -eq 0 ]; then
             echo "::error::RTW88 build failed to produce any .ko file!"
