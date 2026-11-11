@@ -303,7 +303,7 @@ jobs:
           sed -i 's|cp "$f" "$FWDIR/$b"|cp -r "$f" "$FWDIR/$b"|g' "$PKG/service.sh"
 
           # Load dependencies in exact order
-          sed -i 's|"\$KMOD"/mt76\.ko.*"\$KMOD"/\*\.ko|"\$KMOD"/rtw_core.ko "\$KMOD"/rtw_8723x.ko "\$KMOD"/rtw_8723d.ko "\$KMOD"/rtw_usb.ko "\$KMOD"/rtw_8723du.ko "\$KMOD"/*.ko|g' "$PKG/service.sh"
+          sed -i '/for m in "\$KMOD"\/mac80211\.ko/,/done/c\for m in "$KMOD"/mac80211.ko \\\n         "$KMOD"/rtw_core.ko \\\n         "$KMOD"/rtw_8723x.ko \\\n         "$KMOD"/rtw_8723d.ko \\\n         "$KMOD"/rtw_usb.ko \\\n         "$KMOD"/rtw_8723du.ko ; do\n  [ -e "$m" ] || continue\n  base=$(basename "$m" .ko); lsn=$(echo "$base" | tr "-" "_")\n  lsmod | grep -q "^$lsn " && continue\n  insmod "$m" 2>/dev/null && log "loaded $base"\ndone' "$PKG/service.sh"
 
           chmod 755 "$PKG/service.sh" "$PKG/uninstall.sh" "$PKG/action.sh"
 
