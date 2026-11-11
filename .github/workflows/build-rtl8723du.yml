@@ -72,7 +72,17 @@ jobs:
             exit 1
           fi
 
+      - name: Restore Kernel & Clang Cache
+        id: cache-kernel
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ks
+            clang
+          key: gki-kernel-${{ github.event.inputs.kcommit }}-${{ github.event.inputs.clang_ver }}-${{ github.event.inputs.lto }}-${{ github.event.inputs.btf }}
+
       - name: Fetch kernel source (exact commit)
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
           mkdir -p ks
           URL="https://android.googlesource.com/kernel/common/+archive/${{ github.event.inputs.kcommit }}.tar.gz"
@@ -96,6 +106,7 @@ jobs:
           ls ks/Makefile && head -3 ks/Makefile
 
       - name: Fetch Android Clang
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
           mkdir -p clang
           CV="${{ github.event.inputs.clang_ver }}"
@@ -123,6 +134,7 @@ jobs:
           clang/bin/clang --version
 
       - name: Configure kernel
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
         working-directory: ks
         env:
           BTF: ${{ github.event.inputs.btf }}
@@ -150,6 +162,7 @@ jobs:
           make LLVM=1 ARCH=arm64 O=out olddefconfig
 
       - name: Prepare kernel for external modules
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
         working-directory: ks
         run: |
           export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
@@ -165,10 +178,20 @@ jobs:
           free -h
 
       - name: Build in-tree mac80211
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
         working-directory: ks
         run: |
           export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
           make LLVM=1 ARCH=arm64 O=out -j$(nproc)
+
+      - name: Save Kernel & Clang Cache
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ks
+            clang
+          key: ${{ steps.cache-kernel.outputs.cache-primary-key || format('gki-kernel-{0}-{1}-{2}-{3}', github.event.inputs.kcommit, github.event.inputs.clang_ver, github.event.inputs.lto, github.event.inputs.btf) }}
 
       - name: Build RTW88 driver
         env:
@@ -180,9 +203,11 @@ jobs:
           git clone --depth 1 "$OOT_REPO" oot
           cd oot
 
-          echo "Applying 5.15 compatibility patch..."
+          echo "Applying 5.15 compatibility patches..."
           # Replace 5.17+ device_get_mac_address with 1 so efuse fallback works cleanly
           sed -i 's/device_get_mac_address([^)]*)/1/g' main.c 2>/dev/null || true
+          # Replace 6.13+ ieee80211_purge_tx_queue in usb.c with skb_queue_purge
+          sed -i 's/ieee80211_purge_tx_queue(rtwdev->hw, &txcb->tx_ack_queue);/skb_queue_purge(\&txcb->tx_ack_queue);/g' usb.c 2>/dev/null || true
 
           echo "Writing targeted Makefile for RTL8723DU..."
           cat > Makefile << 'EOF'
