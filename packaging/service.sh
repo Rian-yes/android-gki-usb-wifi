@@ -28,7 +28,18 @@ if [ "$N" -gt 1 ]; then
   log "         the adapter you're using, then reboot - two will conflict."
 fi
 
-# 2) load modules with USB autoprobe OFF so module_init never touches the HW
+# 2) Stage firmware in /data/vendor/fw with vendor_fw_file label (accessible by kernel under SELinux Enforcing)
+FWDIR=/data/vendor/fw
+mkdir -p "$FWDIR/rtw88"
+if [ -d "$FW" ]; then
+  cp -r "$FW"/* "$FWDIR/" 2>/dev/null
+  cp -r "$FW"/* "$FWDIR/rtw88/" 2>/dev/null
+fi
+chmod -R 755 "$FWDIR"
+chcon -R u:object_r:vendor_fw_file:s0 "$FWDIR" 2>/dev/null
+log "firmware staged at $FWDIR"
+
+# 3) load modules with USB autoprobe OFF so module_init never touches the HW
 echo 0 > /sys/bus/usb/drivers_autoprobe 2>/dev/null
 for m in "$KMOD"/mac80211.ko \
          "$KMOD"/rtw_core.ko \
@@ -44,39 +55,43 @@ for m in "$KMOD"/mac80211.ko \
 done
 echo 1 > /sys/bus/usb/drivers_autoprobe 2>/dev/null
 
-# 3) defragment memory for mac80211 high-order queue allocation
+# 4) defragment memory for mac80211 high-order queue allocation
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
 
-# 4) if the card is already attached, bind it now. Retry with USB reset on timeout.
-DRV="/sys/bus/usb/drivers/$DRV_NAME"
+# 5) Transient firmware path switch during USB bind (preserves camera firmware path)
+bind_adapter() {
+  ORIG_FW=$(cat /sys/module/firmware_class/parameters/path 2>/dev/null)
+  [ -z "$ORIG_FW" ] && ORIG_FW="/vendor/firmware"
+  echo "$FWDIR" > /sys/module/firmware_class/parameters/path 2>/dev/null
+
+  for iface in /sys/bus/usb/devices/${1}:*; do
+    [ -d "$iface" ] || continue
+    ib=$(basename "$iface")
+    echo "$ib" > "/sys/bus/usb/drivers/$DRV_NAME/bind" 2>/dev/null && log "bound $ib"
+  done
+
+  sleep 2
+  echo "$ORIG_FW" > /sys/module/firmware_class/parameters/path 2>/dev/null
+  log "restored firmware path to $ORIG_FW"
+}
+
 find_dev() {
   for d in /sys/bus/usb/devices/*/idProduct; do
     dir=$(dirname "$d"); [ -f "$dir/idVendor" ] || continue
     [ "$(cat "$dir/idVendor"):$(cat "$d")" = "$USB_ID" ] && { basename "$dir"; return 0; }
   done; return 1
 }
+
 dev=$(find_dev)
-if [ -z "$dev" ]; then
-  log "card not attached at boot; modules ready, will bind on plug-in"
+if [ -n "$dev" ]; then
+  log "found adapter $dev, binding with transient firmware path..."
+  bind_adapter "$dev"
 else
-  attempt=1
-  while [ $attempt -le 3 ]; do
-    for iface in /sys/bus/usb/devices/${dev}:*; do
-      [ -d "$iface" ] || continue
-      ib=$(basename "$iface")
-      [ -e "$DRV/$ib" ] || echo "$ib" > "$DRV/bind" 2>/dev/null
-    done
-    i=0; while [ $i -lt 12 ]; do ip link show wlan1 >/dev/null 2>&1 && break; sleep 1; i=$((i+1)); done
-    if ip link show wlan1 >/dev/null 2>&1; then log "wlan1 up (attempt $attempt)"; break; fi
-    log "wlan1 not up (attempt $attempt) - USB reset"
-    echo "$dev" > /sys/bus/usb/drivers/usb/unbind 2>/dev/null; sleep 2
-    echo "$dev" > /sys/bus/usb/drivers/usb/bind   2>/dev/null; sleep 3
-    dev=$(find_dev) || break
-    attempt=$((attempt+1))
-  done
+  log "card not attached at boot; ready for plug-in"
 fi
 
-# 5) set monitor mode once wlan1 exists
+# 6) set monitor mode once wlan1 exists
 CHROOT_BIN=/data/data/com.termux/files/usr/bin/chroot
 ROOTFS=/data/local/nhsystem/kali-arm64
 

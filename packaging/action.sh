@@ -7,6 +7,9 @@
 
 MODDIR="${0%/*}"
 AUTOMON="$MODDIR/automonitor"
+FWDIR=/data/vendor/fw
+DRV_NAME="__DRV_NAME__"
+USB_ID="__USB_ID__"
 
 IW=""
 if [ -x "/data/data/com.termux/files/usr/bin/iw" ]; then
@@ -18,17 +21,40 @@ elif [ -x "/data/local/nhsystem/kali-arm64/usr/sbin/iw" ]; then
   IW="$CHROOT_BIN $ROOTFS /usr/sbin/iw"
 fi
 
-echo "GKI USB Wi-Fi — monitor mode toggle"
+echo "GKI USB Wi-Fi (__DRV_NAME__) — Control & Toggle"
 echo ""
+
+# If adapter is plugged in but wlan1 is not present, bind with transient firmware path
+if ! ip link show wlan1 >/dev/null 2>&1; then
+  for d in /sys/bus/usb/devices/*/idProduct; do
+    dir=$(dirname "$d"); [ -f "$dir/idVendor" ] || continue
+    if [ "$(cat "$dir/idVendor"):$(cat "$d")" = "$USB_ID" ]; then
+      dev=$(basename "$dir")
+      echo "Found adapter $dev. Initializing firmware & binding..."
+      ORIG_FW=$(cat /sys/module/firmware_class/parameters/path 2>/dev/null)
+      [ -z "$ORIG_FW" ] && ORIG_FW="/vendor/firmware"
+      echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+      echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+      echo "$FWDIR" > /sys/module/firmware_class/parameters/path 2>/dev/null
+      for iface in /sys/bus/usb/devices/${dev}:*; do
+        [ -d "$iface" ] || continue
+        echo "$(basename "$iface")" > "/sys/bus/usb/drivers/$DRV_NAME/bind" 2>/dev/null
+      done
+      sleep 2
+      echo "$ORIG_FW" > /sys/module/firmware_class/parameters/path 2>/dev/null
+      break
+    fi
+  done
+fi
 
 if ! ip link show wlan1 >/dev/null 2>&1; then
   echo "wlan1 not present."
-  echo "Plug the adapter in, wait a few seconds, then press Action again."
+  echo "Plug the adapter in, wait 2 seconds, then press Action again."
   exit 0
 fi
 
 if [ -z "$IW" ]; then
-  echo "iw tool not found in Termux or Kali chroot."
+  echo "wlan1 is active, but iw tool not found in Termux or Kali chroot."
   exit 0
 fi
 
