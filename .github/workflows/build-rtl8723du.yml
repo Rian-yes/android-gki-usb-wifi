@@ -24,9 +24,9 @@ on:
         required: true
         default: "thin"
       oot_repo:
-        description: "Git URL of the RTL8723DU driver"
+        description: "Git URL of the RTW88 driver repo"
         required: true
-        default: "https://github.com/lwfinger/rtl8723du"
+        default: "https://github.com/lwfinger/rtw88"
       oot_branch:
         description: "Branch/tag of the driver repo"
         required: true
@@ -46,7 +46,7 @@ jobs:
           echo "clang   = ${{ github.event.inputs.clang_ver }}"
           echo "btf     = ${{ github.event.inputs.btf }}"
           echo "lto     = ${{ github.event.inputs.lto }}"
-          echo "driver  = rtl8723du"
+          echo "driver  = rtl8723du (rtw88)"
           echo "repo    = ${{ github.event.inputs.oot_repo }} @ ${{ github.event.inputs.oot_branch }}"
 
       - name: Free disk space
@@ -170,7 +170,7 @@ jobs:
           export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
           make LLVM=1 ARCH=arm64 O=out -j$(nproc)
 
-      - name: Build RTL8723DU driver
+      - name: Build RTW88 driver
         env:
           OOT_REPO: ${{ github.event.inputs.oot_repo }}
           OOT_BRANCH: ${{ github.event.inputs.oot_branch }}
@@ -180,30 +180,16 @@ jobs:
           git clone --depth 1 "$OOT_REPO" oot
           cd oot
 
-          echo "Applying compiler fixes for Clang..."
-          # Fix 1: Header guards in phydm
-          sed -i 's/#define[[:space:]]\+__PHYDM_FEATURES$/#define __PHYDM_FEATURES_H__/' hal/phydm/phydm_features.h 2>/dev/null || true
-          sed -i 's/#define[[:space:]]\+__PHYDKFREE_H__$/#define __PHYDMKFREE_H__/' hal/phydm/halrf_kfree.h 2>/dev/null || true
-
-          # Fix 2: Uninitialized variables in rtw_recv.h
-          sed -i 's/unsigned char \*buf_desc;/unsigned char *buf_desc = NULL;/' include/rtw_recv.h 2>/dev/null || true
-          sed -i 's/u8 \*buf_star;/u8 *buf_star = NULL;/' include/rtw_recv.h 2>/dev/null || true
-
-          # Fix 3: Disable sign-file call in Makefile
-          sed -i 's/.*sign-file.*/# disabled sign-file/' Makefile 2>/dev/null || true
-
-          echo "Building RTL8723DU against prepared kernel..."
-          CURDIR="$(pwd)"
+          echo "Building RTW88 against prepared kernel..."
           make -j$(nproc) \
             KSRC="$GITHUB_WORKSPACE/ks/out" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 CC=clang LD=ld.lld \
-            USER_EXTRA_CFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough -I$CURDIR/include -I$CURDIR/platform -I$CURDIR/hal"
+            LLVM=1 CC=clang LD=ld.lld
 
           KO_COUNT=$(find . -name "*.ko" | wc -l)
           if [ "$KO_COUNT" -eq 0 ]; then
-            echo "::error::RTL8723DU build failed to produce any .ko file!"
+            echo "::error::RTW88 build failed to produce any .ko file!"
             exit 1
           fi
           find . -name "*.ko" -exec ls -la {} \;
@@ -231,15 +217,19 @@ jobs:
           COMMIT="${{ github.event.inputs.kcommit }}"
           SHORT="$(echo "$COMMIT" | cut -c1-12)"
           PKG="pkg"
-          rm -rf "$PKG"; mkdir -p "$PKG/modules" "$PKG/firmware" "$PKG/META-INF/com/google/android"
+          rm -rf "$PKG"; mkdir -p "$PKG/modules" "$PKG/firmware/rtw88" "$PKG/META-INF/com/google/android"
 
           cp ko/*.ko "$PKG/modules/"
           rm -f "$PKG/modules/cfg80211.ko"
           cp ko/Module.symvers "$PKG/modules/" 2>/dev/null || true
 
-          LEAF=$(cd ko && ls -1 *.ko | grep -vE '^(mac80211|cfg80211)\.ko$' | head -1)
-          [ -n "$LEAF" ] || { echo "::error::No driver module in ko/"; exit 1; }
-          DRVNAME="rtl8723du"
+          if [ -d "oot/firmware" ]; then
+            cp oot/firmware/*.bin "$PKG/firmware/rtw88/" 2>/dev/null || true
+            cp oot/firmware/*.bin "$PKG/firmware/" 2>/dev/null || true
+          fi
+
+          LEAF="rtw_8723du.ko"
+          DRVNAME="rtw_8723du"
           USBID="0bda:d723"
 
           cp packaging/service.sh "$PKG/service.sh"
@@ -253,12 +243,14 @@ jobs:
           version=${SHORT}
           versionCode=1
           author=markatsos, Rian-yes
-          description=External USB Wi-Fi (RTL8723DU) for GKI kernel ${SHORT}. Auto monitor-mode on plug-in. Enable only ONE adapter module at a time.
+          description=External USB Wi-Fi (RTL8723DU via RTW88) for GKI kernel ${SHORT}. Auto monitor-mode on plug-in.
           PROP
 
           sed -i "s|__USB_ID__|$USBID|g" "$PKG/service.sh" "$PKG/action.sh"
           sed -i "s|__DRV_KO__|$LEAF|g"   "$PKG/service.sh" "$PKG/action.sh"
           sed -i "s|__DRV_NAME__|$DRVNAME|g" "$PKG/service.sh" "$PKG/action.sh"
+
+          sed -i '/for m in "\$KMOD"\/mac80211\.ko/i # Load rtw88 dependencies in order\nfor m in "\$KMOD"/mac80211.ko "\$KMOD"/rtw_core.ko "\$KMOD"/rtw_8723x.ko "\$KMOD"/rtw_8723d.ko "\$KMOD"/rtw_usb.ko "\$KMOD"/rtw_8723du.ko; do [ -e "\$m" ] || continue; base=\$(basename "\$m" .ko); lsn=\$(echo "\$base" | tr "-" "_"); lsmod | grep -q "^\$lsn " && continue; insmod "\$m" 2>/dev/null && log "loaded \$base"; done' "$PKG/service.sh"
 
           chmod +x "$PKG/service.sh" "$PKG/action.sh"
           chmod 755 "$PKG/META-INF/com/google/android/update-binary"
