@@ -180,17 +180,34 @@ jobs:
           git clone --depth 1 "$OOT_REPO" oot
           cd oot
 
-          echo "Applying 5.15 compatibility patches..."
+          echo "Applying 5.15 compatibility patch..."
+          # Replace 5.17+ device_get_mac_address with 1 so efuse fallback works cleanly
           sed -i 's/device_get_mac_address([^)]*)/1/g' main.c 2>/dev/null || true
-          sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' rtw8723b.c 2>/dev/null || true
-          sed -i '/rtw8723bs/d; /rtw8723cs/d' Makefile 2>/dev/null || true
-          sed -i 's/rtw_8723bs//g; s/rtw_8723cs//g' Makefile 2>/dev/null || true
-          rm -f rtw8723bs.c rtw8723cs.c 2>/dev/null || true
-          make -j$(nproc) \
-            KSRC="$GITHUB_WORKSPACE/ks/out" \
+
+          echo "Writing targeted Makefile for RTL8723DU..."
+          cat > Makefile << 'EOF'
+          ccflags-y += -O2 -std=gnu11 -Wno-declaration-after-statement -Wno-error
+          ccflags-y += -DCONFIG_RTW88_LEDS=1
+          ccflags-y += -DCONFIG_RTW88_DEBUG=1
+          ccflags-y += -DCONFIG_RTW88_DEBUGFS=1
+          ccflags-y += -D__CHECK_ENDIAN__
+
+          obj-m := rtw_core.o rtw_8723d.o rtw_8723du.o rtw_8723x.o rtw_usb.o
+
+          rtw_core-objs := main.o led.o mac80211.o util.o debug.o tx.o rx.o mac.o phy.o coex.o efuse.o fw.o ps.o sec.o bf.o regd.o sar.o wow.o
+          rtw_8723d-objs  := rtw8723d.o rtw8723d_table.o
+          rtw_8723du-objs := rtw8723du.o
+          rtw_8723x-objs  := rtw8723x.o
+          rtw_usb-objs    := usb.o
+          EOF
+
+          echo "Building RTW88 modules against prepared kernel..."
+          make -j$(nproc) -C "$GITHUB_WORKSPACE/ks/out" M="$(pwd)" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 CC=clang LD=ld.lld
+            LLVM=1 CC=clang LD=ld.lld \
+            modules
+
           KO_COUNT=$(find . -name "*.ko" | wc -l)
           if [ "$KO_COUNT" -eq 0 ]; then
             echo "::error::RTW88 build failed to produce any .ko file!"
@@ -227,6 +244,7 @@ jobs:
           rm -f "$PKG/modules/cfg80211.ko"
           cp ko/Module.symvers "$PKG/modules/" 2>/dev/null || true
 
+          # Stage firmware
           if [ -d "oot/firmware" ]; then
             cp oot/firmware/*.bin "$PKG/firmware/rtw88/" 2>/dev/null || true
             cp oot/firmware/*.bin "$PKG/firmware/" 2>/dev/null || true
@@ -254,7 +272,11 @@ jobs:
           sed -i "s|__DRV_KO__|$LEAF|g"   "$PKG/service.sh" "$PKG/action.sh"
           sed -i "s|__DRV_NAME__|$DRVNAME|g" "$PKG/service.sh" "$PKG/action.sh"
 
-          sed -i '/for m in "\$KMOD"\/mac80211\.ko/i # Load rtw88 dependencies in order\nfor m in "\$KMOD"/mac80211.ko "\$KMOD"/rtw_core.ko "\$KMOD"/rtw_8723x.ko "\$KMOD"/rtw_8723d.ko "\$KMOD"/rtw_usb.ko "\$KMOD"/rtw_8723du.ko; do [ -e "\$m" ] || continue; base=\$(basename "\$m" .ko); lsn=\$(echo "\$base" | tr "-" "_"); lsmod | grep -q "^\$lsn " && continue; insmod "\$m" 2>/dev/null && log "loaded \$base"; done' "$PKG/service.sh"
+          # Support recursive firmware copy in service.sh
+          sed -i 's|cp "$f" "$FWDIR/$b"|cp -r "$f" "$FWDIR/$b"|g' "$PKG/service.sh"
+
+          # Load dependencies in exact order
+          sed -i 's|"\$KMOD"/mt76\.ko.*"\$KMOD"/\*\.ko|"\$KMOD"/rtw_core.ko "\$KMOD"/rtw_8723x.ko "\$KMOD"/rtw_8723d.ko "\$KMOD"/rtw_usb.ko "\$KMOD"/rtw_8723du.ko "\$KMOD"/*.ko|g' "$PKG/service.sh"
 
           chmod +x "$PKG/service.sh" "$PKG/action.sh"
           chmod 755 "$PKG/META-INF/com/google/android/update-binary"
