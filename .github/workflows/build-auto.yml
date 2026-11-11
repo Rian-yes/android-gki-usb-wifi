@@ -281,14 +281,27 @@ jobs:
           git clone --depth 1 "$OOT_REPO" oot
           cd oot
           echo "Building $(basename "$OOT_REPO") @ $OOT_BRANCH against prepared kernel..."
+          # Patch known driver issues when compiling with Clang
+          sed -i 's/#define[[:space:]]\+__PHYDM_FEATURES$/#define __PHYDM_FEATURES_H__/' hal/phydm/phydm_features.h 2>/dev/null || true
+          sed -i 's/#define[[:space:]]\+__PHYDKFREE_H__$/#define __PHYDMKFREE_H__/' hal/phydm/halrf_kfree.h 2>/dev/null || true
+          sed -i 's/unsigned char \*buf_desc;/unsigned char *buf_desc = NULL;/' include/rtw_recv.h 2>/dev/null || true
+          sed -i 's/u8 \*buf_star;/u8 *buf_star = NULL;/' include/rtw_recv.h 2>/dev/null || true
+          sed -i 's/.*sign-file.*/# disabled sign-file/' Makefile 2>/dev/null || true
+
           # Most rtl88xxau Makefiles accept KSRC + cross vars
           make -j$(nproc) \
             KSRC="$GITHUB_WORKSPACE/ks/out" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 CC=clang LD=ld.lld \
-            || { echo "::warning::OOT build failed with LLVM; retrying with default toolchain"; \
-                 make -j$(nproc) KSRC="$GITHUB_WORKSPACE/ks/out" ARCH=arm64 || true; }
+            KCFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough" \
+            USER_EXTRA_CFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough" \
+            EXTRA_CFLAGS="-Wno-error -Wno-uninitialized -Wno-header-guard -Wno-implicit-fallthrough"
+          KO_COUNT=$(find . -name "*.ko" | wc -l)
+          if [ "$KO_COUNT" -eq 0 ]; then
+            echo "::error::Out-of-tree driver build failed to produce any .ko files!"
+            exit 1
+          fi
           find . -name "*.ko" -exec ls -la {} \;
 
       - name: Show module_layout CRC
@@ -329,7 +342,23 @@ jobs:
             rt2800usb) DRVNAME=rt2800usb; LEAF=rt2800usb.ko; FW=""; USBID="148f:5370" ;;
             ath9k_htc) DRVNAME=ath9k_htc; LEAF=ath9k_htc.ko; FW="ath9k_htc/htc_9271-1.4.0.fw ath9k_htc/htc_7010-1.4.0.fw"; USBID="0cf3:9271" ;;
             rtl8xxxu) DRVNAME=rtl8xxxu; LEAF=rtl8xxxu.ko; FW=""; USBID="0bda:8178" ;;
-            *) echo "packaging: unsupported driver $DRIVER for Magisk zip (in-tree only)"; exit 0 ;;
+            rtl88xxau_oot)
+              LEAF=$(cd ko && ls -1 *.ko 2>/dev/null | grep -vE '^(mac80211|cfg80211)\.ko$' | head -1)
+              if [ -z "$LEAF" ]; then
+                echo "packaging: no out-of-tree driver module in ko/, skipping Magisk zip"
+                exit 0
+              fi
+              DRVNAME="${LEAF%.ko}"
+              FW=""
+              case "$DRVNAME" in
+                *8723du*|*8723d*) USBID="0bda:d723" ;;
+                *8812au*|*8812a*|*88xxau*) USBID="0bda:8812" ;;
+                *8814au*|*8814a*) USBID="0bda:8813" ;;
+                *8821au*|*8821a*) USBID="0bda:8811" ;;
+                *) USBID="unknown" ;;
+              esac
+              ;;
+            *) echo "packaging: unsupported driver $DRIVER for Magisk zip"; exit 0 ;;
           esac
 
           PKG="pkg"
