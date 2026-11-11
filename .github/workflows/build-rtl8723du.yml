@@ -265,7 +265,8 @@ jobs:
           PKG="pkg"
           rm -rf "$PKG"; mkdir -p "$PKG/modules" "$PKG/firmware/rtw88" "$PKG/META-INF/com/google/android"
 
-          cp ko/*.ko "$PKG/modules/"
+          # Modules from collected ko/
+          cp ko/*.ko "$PKG/modules/" 2>/dev/null || true
           rm -f "$PKG/modules/cfg80211.ko"
           cp ko/Module.symvers "$PKG/modules/" 2>/dev/null || true
 
@@ -279,23 +280,24 @@ jobs:
           DRVNAME="rtw_8723du"
           USBID="0bda:d723"
 
-          cp packaging/service.sh "$PKG/service.sh"
-          cp packaging/action.sh "$PKG/action.sh"
-          cp packaging/update-binary "$PKG/META-INF/com/google/android/update-binary"
-          cp packaging/updater-script "$PKG/META-INF/com/google/android/updater-script"
-
+          # module.prop following official format
           cat > "$PKG/module.prop" <<PROP
           id=gki_usb_wifi_${SHORT}_rtl8723du
           name=GKI USB Wi-Fi (RTL8723DU)
           version=${SHORT}
           versionCode=1
           author=markatsos, Rian-yes
-          description=External USB Wi-Fi (RTL8723DU via RTW88) for GKI kernel ${SHORT}. Auto monitor-mode on plug-in.
+          description=Loads RTL8723DU (RTW88) on kernel ACK commit ${SHORT}. Auto monitor-mode on plug-in.
           PROP
+          echo "actionIcon=" >> "$PKG/module.prop"
 
-          sed -i "s|__USB_ID__|$USBID|g" "$PKG/service.sh" "$PKG/action.sh"
-          sed -i "s|__DRV_KO__|$LEAF|g"   "$PKG/service.sh" "$PKG/action.sh"
-          sed -i "s|__DRV_NAME__|$DRVNAME|g" "$PKG/service.sh" "$PKG/action.sh"
+          # service.sh from template, with placeholders filled
+          sed -e "s|__USB_ID__|$USBID|" \
+              -e "s|__DRV_KO__|$LEAF|" \
+              -e "s|__DRV_NAME__|$DRVNAME|" \
+              packaging/service.sh > "$PKG/service.sh"
+          cp packaging/uninstall.sh "$PKG/uninstall.sh"
+          cp packaging/action.sh "$PKG/action.sh"
 
           # Support recursive firmware copy in service.sh
           sed -i 's|cp "$f" "$FWDIR/$b"|cp -r "$f" "$FWDIR/$b"|g' "$PKG/service.sh"
@@ -303,22 +305,34 @@ jobs:
           # Load dependencies in exact order
           sed -i 's|"\$KMOD"/mt76\.ko.*"\$KMOD"/\*\.ko|"\$KMOD"/rtw_core.ko "\$KMOD"/rtw_8723x.ko "\$KMOD"/rtw_8723d.ko "\$KMOD"/rtw_usb.ko "\$KMOD"/rtw_8723du.ko "\$KMOD"/*.ko|g' "$PKG/service.sh"
 
-          chmod +x "$PKG/service.sh" "$PKG/action.sh"
-          chmod 755 "$PKG/META-INF/com/google/android/update-binary"
+          chmod 755 "$PKG/service.sh" "$PKG/uninstall.sh" "$PKG/action.sh"
 
-          ZIPNAME="gki-usb-wifi-${SHORT}-rtl8723du"
-          (cd "$PKG" && zip -r "../$ZIPNAME.zip" .)
-          echo "zipname=$ZIPNAME" >> "$GITHUB_OUTPUT"
+          # Official Magisk/KernelSU/APatch installer shim
+          cat > "$PKG/META-INF/com/google/android/update-binary" <<'UB'
+          #!/sbin/sh
+          # Magisk module installer shim
+          umask 022
+          OUTFD=$2; ZIP=$3
+          . /data/adb/magisk/util_functions.sh 2>/dev/null || true
+          install_module
+          exit 0
+          UB
+          echo "#MAGISK" > "$PKG/META-INF/com/google/android/updater-script"
+
+          echo "module tree ready:"
+          find "$PKG" -maxdepth 2 -type f | sort
+          echo "zipname=gki-usb-wifi-${SHORT}-rtl8723du" >> "$GITHUB_OUTPUT"
 
       - name: Upload Magisk module (flashable as-is)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.pkg.outputs.zipname }}
-          path: ${{ steps.pkg.outputs.zipname }}.zip
-          if-no-files-found: error
+          name: ${{ steps.pkg.outputs.zipname || 'magisk-module' }}
+          path: pkg/
 
       - name: Upload raw modules
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: modules
           path: ko/
