@@ -15,9 +15,12 @@ echo "=== GKI USB Wi-Fi ($DRV_NAME) ==="
 # Find adapter port dynamically (handles direct OTG or powered USB hub)
 dev=""
 for d in /sys/bus/usb/devices/*/idProduct; do
-  dir=$(dirname "$d"); [ -f "$dir/idVendor" ] || continue
-  if [ "$(cat "$dir/idVendor" 2>/dev/null):$(cat "$d" 2>/dev/null)" = "$USB_ID" ]; then
-    dev=$(basename "$dir"); break
+  dir=$(dirname "$d")
+  v=$(cat "$dir/idVendor" 2>/dev/null)
+  p=$(cat "$d" 2>/dev/null)
+  if [ "$v:$p" = "$USB_ID" ]; then
+    dev=$(basename "$dir")
+    break
   fi
 done
 
