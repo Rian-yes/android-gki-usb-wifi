@@ -22,18 +22,6 @@ n=0
 while [ "$(getprop sys.boot_completed)" != "1" ] && [ $n -lt 150 ]; do sleep 2; n=$((n+1)); done
 sleep 20
 
-# 2) stage firmware where the kernel loader can read it
-FWDIR=/data/local/tmp/fw
-mkdir -p "$FWDIR"
-for f in "$FW"/*; do
-  [ -e "$f" ] || continue
-  b=$(basename "$f")
-  cp "$f" "$FWDIR/$b"
-  chmod 644 "$FWDIR/$b"
-  chcon u:object_r:vendor_file:s0 "$FWDIR/$b" 2>/dev/null
-done
-echo "$FWDIR" > /sys/module/firmware_class/parameters/path 2>/dev/null
-log "firmware staged at $FWDIR"
 
 # Warn if more than one adapter module is enabled - they fight over wlan1.
 N=$(ls -d /data/adb/modules/gki_usb_wifi_* 2>/dev/null | wc -l)
@@ -71,8 +59,13 @@ if [ -z "$dev" ]; then
 else
 
 attempt=1
+echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
 while [ $attempt -le 3 ]; do
-  [ -e "$DRV/${dev}:1.0" ] || echo "${dev}:1.0" > "$DRV/bind" 2>/dev/null
+  for iface in /sys/bus/usb/devices/${dev}:*; do
+    [ -d "$iface" ] || continue
+    ib=$(basename "$iface")
+    [ -e "$DRV/$ib" ] || echo "$ib" > "$DRV/bind" 2>/dev/null
+  done
   i=0; while [ $i -lt 12 ]; do ip link show wlan1 >/dev/null 2>&1 && break; sleep 1; i=$((i+1)); done
   if ip link show wlan1 >/dev/null 2>&1; then log "wlan1 up (attempt $attempt)"; break; fi
   log "wlan1 not up (attempt $attempt) - USB reset"
@@ -88,26 +81,29 @@ fi
 #    ~10 min (e.g. NetHunter never opened this session).
 CHROOT_BIN=/data/data/com.termux/files/usr/bin/chroot
 ROOTFS=/data/local/nhsystem/kali-arm64
-IW=/usr/sbin/iw
 
 set_monitor_bg() {
   (
     i=0
     while [ $i -lt 300 ]; do          # up to ~10 min
-      if ip link show wlan1 >/dev/null 2>&1 \
-         && [ -x "$CHROOT_BIN" ] && [ -e "$ROOTFS$IW" ]; then
-        ip link set wlan1 down 2>/dev/null
-        "$CHROOT_BIN" "$ROOTFS" "$IW" dev wlan1 set type monitor 2>/dev/null
-        ip link set wlan1 up 2>/dev/null
-        m=$("$CHROOT_BIN" "$ROOTFS" "$IW" dev wlan1 info 2>/dev/null | grep -o 'type monitor')
-        if [ "$m" = "type monitor" ]; then
-          log "wlan1 set to MONITOR mode"
+      if ip link show wlan1 >/dev/null 2>&1; then
+        if [ -x "/data/data/com.termux/files/usr/bin/iw" ]; then
+          export LD_LIBRARY_PATH=/data/data/com.termux/files/usr/lib
+          /data/data/com.termux/files/usr/bin/iw dev wlan1 set type monitor 2>/dev/null
+          ip link set wlan1 up 2>/dev/null
+          log "wlan1 set to MONITOR mode via Termux iw"
+          return 0
+        elif [ -x "$CHROOT_BIN" ] && [ -e "$ROOTFS/usr/sbin/iw" ]; then
+          ip link set wlan1 down 2>/dev/null
+          "$CHROOT_BIN" "$ROOTFS" /usr/sbin/iw dev wlan1 set type monitor 2>/dev/null
+          ip link set wlan1 up 2>/dev/null
+          log "wlan1 set to MONITOR mode via Kali chroot"
           return 0
         fi
       fi
       sleep 2; i=$((i+1))
     done
-    log "monitor mode not set (wlan1 or Kali chroot unavailable) - use the Action button in Magisk, or set it manually"
+    log "monitor mode not set - use the Action button in Magisk, or set it manually"
   ) &
 }
 
