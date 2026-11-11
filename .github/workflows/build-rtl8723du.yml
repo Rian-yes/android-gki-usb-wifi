@@ -183,7 +183,9 @@ jobs:
           echo "Applying 5.15 compatibility patches..."
           # device_get_mac_address was added in kernel 5.17+; fallback to random MAC on 5.15
           sed -i 's/device_get_mac_address([^)]*)/1/g' main.c 2>/dev/null || true
-
+          # Disable building unneeded modules (like SDIO rtw8723bs) that fail on GKI 5.15
+          sed -i '/rtw8723bs/d' Makefile 2>/dev/null || true
+          sed -i '/rtw8723cs/d' Makefile 2>/dev/null || true
           echo "Building RTW88 against prepared kernel..."
           make -j$(nproc) \
             KSRC="$GITHUB_WORKSPACE/ks/out" \
