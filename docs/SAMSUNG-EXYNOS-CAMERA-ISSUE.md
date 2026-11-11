@@ -12,7 +12,7 @@ This document details the root cause, exact crash logs, affected code paths, and
 
 ### Issue A: Global Kernel Parameter Override (`firmware_class/parameters/path`)
 
-In `packaging/service.sh` (line 35):
+In `packaging/service.sh`:
 ```bash
 FWDIR=/data/local/tmp/fw
 ...
@@ -56,7 +56,7 @@ When any camera app opens:
 
 ### Issue B: Hardcoded USB Interface ID (`${dev}:1.0`) on Combo Chips
 
-In `packaging/service.sh` (line 75):
+In `packaging/service.sh`:
 ```bash
 [ -e "$DRV/${dev}:1.0" ] || echo "${dev}:1.0" > "$DRV/bind" 2>/dev/null
 ```
@@ -85,11 +85,17 @@ On Android devices with fragmented RAM, high-order contiguous page allocations (
 
 ## 2. The Resolution
 
-### Fix 1: Eliminate the Global `firmware_class/parameters/path` Override
-Instead of globally overriding the kernel firmware path 24/7:
-- The override line is removed from `service.sh`.
-- Firmware stays contained strictly in the module's directory under `/data/adb/modules/`.
-- If a temporary firmware path injection is needed for a specific adapter during probe, the original `/sys/module/firmware_class/parameters/path` value must be saved and restored immediately after the driver binds, so other subsystem drivers (camera, audio DSP, modem) retain access to `/vendor/firmware`.
+### Fix 1: Transient Firmware Path Switch
+The driver only requests firmware from userspace **once during driver probe/binding**. Once uploaded, the microcode resides in the adapter's on-board RAM.
+
+Rather than permanently redirecting the kernel firmware path (or attempting dangerous overlay mounts on `/vendor`), `service.sh` and `action.sh` use a **transient 2-second switch**:
+1. Stage the firmware in `/data/vendor/fw` labeled with SELinux context `u:object_r:vendor_fw_file:s0` (readable by the kernel under SELinux `Enforcing`).
+2. Read and save the existing `/sys/module/firmware_class/parameters/path` (defaults to `/vendor/firmware`).
+3. Temporarily set `firmware_class/parameters/path` to `/data/vendor/fw`.
+4. Trigger USB device bind: the kernel firmware loader reads `rtw88/rtw8723d_fw.bin` successfully.
+5. **Immediately restore** `firmware_class/parameters/path` back to `/vendor/firmware`.
+
+This leaves `/vendor/firmware` intact 24/7 for the Camera ISP while reliably provisioning external Wi-Fi firmware.
 
 ### Fix 2: Dynamic Interface Enumeration
 Replace the hardcoded `:1.0` interface binding with dynamic interface iteration:
@@ -103,7 +109,12 @@ done
 This binds any valid interface belonging to the USB device (including `:1.2` on combo chips) while ignoring mismatched interfaces safely.
 
 ### Fix 3: Memory Compaction before Module Probe
-Call `echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true` before driver binding to defragment memory pools and ensure `mac80211` queue allocation succeeds.
+Call:
+```bash
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+```
+before driver binding to defragment memory pools and ensure `mac80211` queue allocation succeeds.
 
 ### Fix 4: Universal `iw` Tool Detection
 Check Termux's native `iw` binary before falling back to Kali chroot:
@@ -138,7 +149,15 @@ This overrides the global kernel firmware search path. Samsung's Exynos camera I
 RTL8723DU and other combo chips expose Bluetooth on interface `:1.0` and Wi-Fi on `:1.2`. Hardcoding `echo "${dev}:1.0" > "$DRV/bind"` in `service.sh` fails to bind the Wi-Fi interface.
 
 #### Suggested Solution
-1. Do not leave `/sys/module/firmware_class/parameters/path` permanently pointing to `$FWDIR`. Restore it back to default after binding or do not set it globally.
+1. Use a transient firmware path switch during device bind instead of permanently overriding it:
+   ```bash
+   ORIG_FW=$(cat /sys/module/firmware_class/parameters/path 2>/dev/null)
+   [ -z "$ORIG_FW" ] && ORIG_FW="/vendor/firmware"
+   echo "$FWDIR" > /sys/module/firmware_class/parameters/path
+   # bind interfaces...
+   sleep 2
+   echo "$ORIG_FW" > /sys/module/firmware_class/parameters/path
+   ```
 2. Bind all interfaces dynamically (`for iface in /sys/bus/usb/devices/${dev}:*; do echo $(basename $iface) > "$DRV/bind"; done`).
 3. Call `echo 1 > /proc/sys/vm/compact_memory` before loading to avoid `-ENOMEM` in `mac80211` queue allocation.
 ```
