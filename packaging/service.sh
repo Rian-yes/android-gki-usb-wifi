@@ -1,45 +1,49 @@
 #!/system/bin/sh
-# service.sh - Magisk/KernelSU late_start service for the GKI USB Wi-Fi module.
-# Loads mac80211 + the USB driver the safe way (autoprobe off, then sysfs bind)
-# so watchdogs cannot panic during module insertion.
-#
-# This file is generated into the flashable ZIP; MODDIR is the module's own dir.
+# service.sh - Magisk/KernelSU late_start service for GKI USB Wi-Fi module.
+# Enables native kernel USB hot-plug detection, avoids memory fragmentation
+# (-ENOMEM) via proactive compaction, and unifies firmware directory with
+# symlinks to prevent camera ISP microcode failures on Samsung/Exynos.
 
-MODDIR="${0%/*}"                      # this module's install dir
+MODDIR="${0%/*}"
 KMOD="$MODDIR/modules"
 FW="$MODDIR/firmware"
-USB_ID="__USB_ID__"                   # filled in by the build (e.g. 0bda:d723)
-DRV_KO="__DRV_KO__"                   # leaf module filename (e.g. rtw_8723du.ko)
-DRV_NAME="__DRV_NAME__"               # driver dir under /sys/bus/usb/drivers (e.g. rtw_8723du)
+USB_ID="__USB_ID__"
+DRV_KO="__DRV_KO__"
+DRV_NAME="__DRV_NAME__"
 
 LOG="$MODDIR/load.log"
 log() { echo "$(date '+%H:%M:%S') $*" >> "$LOG"; }
 : > "$LOG"
 
-# 1) wait for boot + a stable moment
+# 1) Wait for boot
 n=0
 while [ "$(getprop sys.boot_completed)" != "1" ] && [ $n -lt 150 ]; do sleep 2; n=$((n+1)); done
-sleep 10
+sleep 5
 
-# Warn if more than one adapter module is enabled - they fight over wlan1.
-N=$(ls -d /data/adb/modules/gki_usb_wifi_* 2>/dev/null | wc -l)
-if [ "$N" -gt 1 ]; then
-  log "WARNING: $N gki_usb_wifi modules are installed. Enable only the one for"
-  log "         the adapter you're using, then reboot - two will conflict."
-fi
-
-# 2) Stage firmware in /data/vendor/fw with vendor_fw_file label (accessible by kernel under SELinux Enforcing)
+# 2) Stage firmware in /data/vendor/fw with symlinks to stock vendor firmware
+# Keeps both Wi-Fi firmware and camera microcode available 24/7 without conflicts.
 FWDIR=/data/vendor/fw
 mkdir -p "$FWDIR/rtw88"
 if [ -d "$FW" ]; then
   cp -r "$FW"/* "$FWDIR/" 2>/dev/null
   cp -r "$FW"/* "$FWDIR/rtw88/" 2>/dev/null
 fi
+for f in /vendor/firmware/*; do
+  [ -e "$f" ] || continue
+  b=$(basename "$f")
+  [ -e "$FWDIR/$b" ] || ln -sf "$f" "$FWDIR/$b" 2>/dev/null
+done
 chmod -R 755 "$FWDIR"
-chcon -R u:object_r:vendor_fw_file:s0 "$FWDIR" 2>/dev/null
-log "firmware staged at $FWDIR"
+chcon -R -h u:object_r:vendor_fw_file:s0 "$FWDIR" 2>/dev/null
+echo "$FWDIR" > /sys/module/firmware_class/parameters/path 2>/dev/null
+log "firmware staged at $FWDIR with vendor symlinks"
 
-# 3) load modules with USB autoprobe OFF so module_init never touches the HW
+# 3) Prevent memory fragmentation for mac80211 queue allocation (native kernel VM tuning)
+sysctl -w vm.compaction_proactiveness=50 2>/dev/null || true
+sysctl -w vm.min_free_kbytes=32768 2>/dev/null || true
+echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+
+# 4) Load kernel modules once (they remain resident in memory)
 echo 0 > /sys/bus/usb/drivers_autoprobe 2>/dev/null
 for m in "$KMOD"/mac80211.ko \
          "$KMOD"/rtw_core.ko \
@@ -53,52 +57,31 @@ for m in "$KMOD"/mac80211.ko \
   lsmod | grep -q "^$lsn " && continue
   insmod "$m" 2>/dev/null && log "loaded $base"
 done
+# Re-enable autoprobe so the kernel natively auto-detects and binds on ANY hotplug!
 echo 1 > /sys/bus/usb/drivers_autoprobe 2>/dev/null
 
-# 4) defragment memory for mac80211 high-order queue allocation
-echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+# 5) If adapter is already plugged in at boot, bind all matching interfaces once
+for d in /sys/bus/usb/devices/*/idProduct; do
+  dir=$(dirname "$d"); [ -f "$dir/idVendor" ] || continue
+  if [ "$(cat "$dir/idVendor" 2>/dev/null):$(cat "$d" 2>/dev/null)" = "$USB_ID" ]; then
+    dev=$(basename "$dir")
+    for iface in /sys/bus/usb/devices/${dev}:*; do
+      [ -d "$iface" ] || continue
+      echo "$(basename "$iface")" > "/sys/bus/usb/drivers/$DRV_NAME/bind" 2>/dev/null
+    done
+    log "bound adapter $dev"
+    break
+  fi
+done
 
-# 5) Transient firmware path switch during USB bind (preserves camera firmware path)
-bind_adapter() {
-  ORIG_FW=$(cat /sys/module/firmware_class/parameters/path 2>/dev/null)
-  [ -z "$ORIG_FW" ] && ORIG_FW="/vendor/firmware"
-  echo "$FWDIR" > /sys/module/firmware_class/parameters/path 2>/dev/null
-
-  for iface in /sys/bus/usb/devices/${1}:*; do
-    [ -d "$iface" ] || continue
-    ib=$(basename "$iface")
-    echo "$ib" > "/sys/bus/usb/drivers/$DRV_NAME/bind" 2>/dev/null && log "bound $ib"
-  done
-
-  sleep 2
-  echo "$ORIG_FW" > /sys/module/firmware_class/parameters/path 2>/dev/null
-  log "restored firmware path to $ORIG_FW"
-}
-
-find_dev() {
-  for d in /sys/bus/usb/devices/*/idProduct; do
-    dir=$(dirname "$d"); [ -f "$dir/idVendor" ] || continue
-    [ "$(cat "$dir/idVendor"):$(cat "$d")" = "$USB_ID" ] && { basename "$dir"; return 0; }
-  done; return 1
-}
-
-dev=$(find_dev)
-if [ -n "$dev" ]; then
-  log "found adapter $dev, binding with transient firmware path..."
-  bind_adapter "$dev"
-else
-  log "card not attached at boot; ready for plug-in"
-fi
-
-# 6) set monitor mode once wlan1 exists
+# 6) Set monitor mode once wlan1 exists
 CHROOT_BIN=/data/data/com.termux/files/usr/bin/chroot
 ROOTFS=/data/local/nhsystem/kali-arm64
 
 set_monitor_bg() {
   (
     i=0
-    while [ $i -lt 300 ]; do          # up to ~10 min
+    while [ $i -lt 60 ]; do
       if ip link show wlan1 >/dev/null 2>&1; then
         if [ -x "/data/data/com.termux/files/usr/bin/iw" ]; then
           export LD_LIBRARY_PATH=/data/data/com.termux/files/usr/lib
@@ -117,18 +100,14 @@ set_monitor_bg() {
       fi
       sleep 2; i=$((i+1))
     done
-    log "monitor mode not set - use the Action button in Magisk, or set it manually"
   ) &
 }
 
-# only try if the module is configured to auto-enable monitor (default: yes)
 AUTOMON="$MODDIR/automonitor"
 [ -f "$AUTOMON" ] || echo 1 > "$AUTOMON"
 if [ "$(cat "$AUTOMON" 2>/dev/null)" = "1" ]; then
   set_monitor_bg
   log "monitor mode: auto-enable requested (background)"
-else
-  log "monitor mode: auto-enable disabled (toggle via Magisk Action button)"
 fi
 
-log "done"
+log "service.sh complete - native kernel USB hot-reload active"

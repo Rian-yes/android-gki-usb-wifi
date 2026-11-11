@@ -85,19 +85,34 @@ On Android devices with fragmented RAM, high-order contiguous page allocations (
 
 ## 2. The Resolution
 
-### Fix 1: Transient Firmware Path Switch
-The driver only requests firmware from userspace **once during driver probe/binding**. Once uploaded, the microcode resides in the adapter's on-board RAM.
+### Fix 1: Unified Firmware Staging via Stock Vendor Symlinks
+Instead of overriding the firmware path exclusively with Wi-Fi firmware (which breaks the camera) or relying on transient path switching (which fails on automatic hot-reload when unplugged and replugged), the optimal solution is a **Unified Firmware Directory**:
 
-Rather than permanently redirecting the kernel firmware path (or attempting dangerous overlay mounts on `/vendor`), `service.sh` and `action.sh` use a **transient 2-second switch**:
-1. Stage the firmware in `/data/vendor/fw` labeled with SELinux context `u:object_r:vendor_fw_file:s0` (readable by the kernel under SELinux `Enforcing`).
-2. Read and save the existing `/sys/module/firmware_class/parameters/path` (defaults to `/vendor/firmware`).
-3. Temporarily set `firmware_class/parameters/path` to `/data/vendor/fw`.
-4. Trigger USB device bind: the kernel firmware loader reads `rtw88/rtw8723d_fw.bin` successfully.
-5. **Immediately restore** `firmware_class/parameters/path` back to `/vendor/firmware`.
+1. Stage the Wi-Fi firmware in `/data/vendor/fw/rtw88/`.
+2. Create symlinks for all stock files in `/vendor/firmware/*` into `/data/vendor/fw/`:
+   ```bash
+   for f in /vendor/firmware/*; do
+     b=$(basename "$f")
+     [ -e "/data/vendor/fw/$b" ] || ln -sf "$f" "/data/vendor/fw/$b"
+   done
+   ```
+3. Point `/sys/module/firmware_class/parameters/path` to `/data/vendor/fw`.
 
-This leaves `/vendor/firmware` intact 24/7 for the Camera ISP while reliably provisioning external Wi-Fi firmware.
+**Result:**
+- The Camera ISP finds all its microcode (`is_mcu_fw.bin`, `pablo_icpufw.bin`, `setfile_imx882.bin`) via the symlinks with zero delays.
+- The USB Wi-Fi dongle finds its firmware on automatic hot-plug at any time without needing background watcher scripts or manual action keys.
+- Zero modifications to system partitions or `/vendor` (everything stays inside `/data`).
 
-### Fix 2: Dynamic Interface Enumeration
+### Fix 2: Proactive Memory Compaction (Fixing -ENOMEM on Hotplug)
+Samsung's default kernel configuration disables proactive memory compaction (`vm.compaction_proactiveness = 0`). Over device uptime, RAM fragments, causing `mac80211` queue allocation to fail (`-ENOMEM` / error `-12`) during USB insertion.
+
+Enabling proactive compaction allows the kernel's native `kcompactd` to maintain contiguous page pools in the background:
+```bash
+sysctl -w vm.compaction_proactiveness=50
+sysctl -w vm.min_free_kbytes=32768
+```
+
+### Fix 3: Dynamic Interface Enumeration
 Replace the hardcoded `:1.0` interface binding with dynamic interface iteration:
 ```bash
 for iface in /sys/bus/usb/devices/${dev}:*; do
@@ -107,15 +122,6 @@ for iface in /sys/bus/usb/devices/${dev}:*; do
 done
 ```
 This binds any valid interface belonging to the USB device (including `:1.2` on combo chips) while ignoring mismatched interfaces safely.
-
-### Fix 3: Memory Compaction before Module Probe
-Call:
-```bash
-echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
-```
-before driver binding to defragment memory pools and ensure `mac80211` queue allocation succeeds.
-
 ### Fix 4: Universal `iw` Tool Detection
 Check Termux's native `iw` binary before falling back to Kali chroot:
 ```bash
