@@ -56,9 +56,30 @@ jobs:
 
       - name: Install deps
         run: |
-          # Replace flaky azure mirror with canonical archive.ubuntu.com
-          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/sources.list 2>/dev/null || true
-          for i in 1 2 3; do sudo apt-get update && break || sleep 5; done
+          # 1) Reliable public DNS resolvers (Cloudflare, Google, Quad9)
+          sudo sh -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 9.9.9.9\n" > /etc/resolv.conf'
+
+          # 2) Populate multi-mirror fallback list
+          sudo sh -c 'cat > /etc/apt/apt-mirrors.txt << "EOF"
+          http://archive.ubuntu.com/ubuntu/
+          http://mirrors.edge.kernel.org/ubuntu/
+          http://ftp.osuosl.org/pub/ubuntu/
+          http://mirror.math.princeton.edu/pub/ubuntu/
+          EOF'
+          sudo sed -i 's|http://.*azure.*ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+
+          # 3) Resilient mirror update loop with automatic fallback
+          UPDATED=0
+          for M in "http://archive.ubuntu.com/ubuntu" "http://mirrors.edge.kernel.org/ubuntu" "http://ftp.osuosl.org/pub/ubuntu"; do
+            echo "Attempting apt update using mirror: $M"
+            sudo sed -i "s|http://archive.ubuntu.com/ubuntu|$M|g" /etc/apt/sources.list 2>/dev/null || true
+            if sudo apt-get update -y; then
+              UPDATED=1
+              break
+            fi
+            sleep 2
+          done
+
           sudo apt-get install -y -o Acquire::Retries=5 --fix-missing \
             bc bison flex libssl-dev libelf-dev \
             lz4 cpio kmod git curl zip file dwarves
