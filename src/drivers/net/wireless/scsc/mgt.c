@@ -738,6 +738,10 @@ int slsi_start_monitor_mode(struct slsi_dev *sdev, struct net_device *dev)
 	 * If the firmware adds Radio TAP header to MA data,
 	 * dev->type = ARPHRD_IEEE80211_RADIOTAP;
 	 */
+	/* Disable hardware IP/TCP/GSO/IPsec offloads so Linux qdisc does not crash on raw 802.11 frames */
+	dev->features = 0;
+	dev->hw_features = 0;
+
 	dev->type = ARPHRD_IEEE80211_RADIOTAP;
 	ndev_vif->activated = true;
 	return 0;

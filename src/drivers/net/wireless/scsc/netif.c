@@ -487,6 +487,16 @@ static int __slsi_net_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 {
 	SLSI_NET_DBG4(dev, SLSI_NETDEV, "IOCTL cmd:0x%.4x\n", cmd);
 
+	/* Support Wireless Extensions for monitor mode tools (airodump-ng, aireplay-ng) */
+	if (cmd == 0x8B06 /* SIOCSIWMODE */) {
+		return 0;
+	}
+	if (cmd == 0x8B07 /* SIOCGIWMODE */) {
+		int *mode = (int *)&rq->ifr_ifru;
+		*mode = 6; /* IW_MODE_MONITOR */
+		return 0;
+	}
+
 	if (cmd == SIOCDEVPRIVATE + 2) { /* 0x89f0 + 2 from wpa_supplicant */
 		return slsi_ioctl(dev, rq, cmd);
 	}

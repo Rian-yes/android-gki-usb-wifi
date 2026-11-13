@@ -950,6 +950,11 @@ static void slsi_rx_data_ind(struct slsi_dev *sdev, struct net_device *dev, stru
 	skb_cb = (struct slsi_skb_cb *)skb->cb;
 	/* pass the data up if the VIF type is Monitor */
 	if (ndev_vif->vif_type == FAPI_VIFTYPE_MONITOR) {
+		static const u8 rt_hdr[8] = {0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00};
+		if (skb_headroom(skb) >= sizeof(rt_hdr)) {
+			skb_push(skb, sizeof(rt_hdr));
+			memcpy(skb->data, rt_hdr, sizeof(rt_hdr));
+		}
 		skb_reset_mac_header(skb);
 		skb->dev = dev;
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
