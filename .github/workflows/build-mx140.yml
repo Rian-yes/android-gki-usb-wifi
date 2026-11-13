@@ -1,0 +1,259 @@
+name: Build Samsung Exynos 1380 (MX140) Monitor Mode Driver
+
+on:
+  workflow_dispatch:
+    inputs:
+      kbranch:
+        description: "ACK branch matching your kernel: android13-5.15"
+        required: true
+        default: "android13-5.15"
+      kcommit:
+        description: "Exact ACK commit (COMMIT_SHORT / full hash)."
+        required: true
+        default: "e787d6ac4af04c06a0120ad773820d43f9b851a9"
+      clang_ver:
+        description: "Android Clang version (e.g. clang-r450784d)."
+        required: true
+        default: "clang-r450784d"
+      btf:
+        description: "Keep CONFIG_DEBUG_INFO_BTF? (y/n)"
+        required: true
+        default: "y"
+      lto:
+        description: "LTO mode: thin | full | none"
+        required: true
+        default: "thin"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Show inputs
+        run: |
+          echo "branch  = ${{ github.event.inputs.kbranch }}"
+          echo "commit  = ${{ github.event.inputs.kcommit }}"
+          echo "clang   = ${{ github.event.inputs.clang_ver }}"
+          echo "btf     = ${{ github.event.inputs.btf }}"
+          echo "lto     = ${{ github.event.inputs.lto }}"
+          echo "target  = Samsung Exynos 1380 (MX140 SCSC Wi-Fi)"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo sh -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 9.9.9.9\n" > /etc/resolv.conf'
+          sudo apt-get update -y || true
+          sudo apt-get install -y --fix-missing \
+            bc bison flex libssl-dev libelf-dev \
+            lz4 cpio kmod git curl zip file dwarves
+          pahole --version || true
+
+      - name: Verify commit is public on ACK
+        run: |
+          H="${{ github.event.inputs.kcommit }}"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://android.googlesource.com/kernel/common/+/$H")
+          echo "gitiles HTTP $CODE for $H"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Commit $H is not public on ACK."
+            exit 1
+          fi
+
+      - name: Restore Kernel & Clang Cache
+        id: cache-kernel
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ks
+            clang
+          key: gki-kernel-${{ github.event.inputs.kcommit }}-${{ github.event.inputs.clang_ver }}-${{ github.event.inputs.lto }}-${{ github.event.inputs.btf }}
+
+      - name: Fetch kernel source (exact commit)
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ks
+          URL="https://android.googlesource.com/kernel/common/+archive/${{ github.event.inputs.kcommit }}.tar.gz"
+          ok=0
+          for try in 1 2 3 4 5; do
+            echo "kernel source download, attempt $try ..."
+            rm -f k.tar.gz
+            if curl -fsSL --retry 3 --retry-delay 3 --retry-all-errors \
+                 --http1.1 "$URL" -o k.tar.gz \
+               && gzip -t k.tar.gz 2>/dev/null; then
+              ok=1; break
+            fi
+            echo "  incomplete/corrupt, retrying..."; sleep 5
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::Could not download the kernel source archive after 5 attempts."
+            exit 1
+          fi
+          tar -xzf k.tar.gz -C ks
+          rm -f k.tar.gz
+          ls ks/Makefile && head -3 ks/Makefile
+
+      - name: Fetch Android Clang
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p clang
+          CV="${{ github.event.inputs.clang_ver }}"
+          got=0
+          fetch() {
+            for try in 1 2 3; do
+              if curl -fsSL --retry 3 --retry-delay 2 "$1" -o c.tar.gz \
+                 && file c.tar.gz | grep -q gzip; then return 0; fi
+              echo "   retry $try failed"; sleep 3
+            done
+            return 1
+          }
+          for BR in android13-release android14-release android12-release android15-release android16-release main master; do
+            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/$BR/$CV.tar.gz"
+            echo "Trying $BR ..."
+            if fetch "$URL"; then
+              tar -xzf c.tar.gz -C clang && got=1 && echo "OK from $BR" && break
+            fi
+            rm -f c.tar.gz
+          done
+          if [ "$got" != "1" ]; then
+            echo "::error::Could not fetch $CV from any known branch."
+            exit 1
+          fi
+          clang/bin/clang --version
+
+      - name: Configure kernel
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        working-directory: ks
+        env:
+          BTF: ${{ github.event.inputs.btf }}
+          LTO: ${{ github.event.inputs.lto }}
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          {
+            echo "CONFIG_WLAN=y"
+            echo "CONFIG_CFG80211=m"
+          } >> arch/arm64/configs/gki_defconfig
+
+          make LLVM=1 ARCH=arm64 O=out gki_defconfig
+
+          if [ "$BTF" != "y" ]; then
+            ./scripts/config --file out/.config -d DEBUG_INFO_BTF
+          fi
+          case "$LTO" in
+            thin) ./scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN ;;
+            none) ./scripts/config --file out/.config -d LTO_CLANG_FULL -d LTO_CLANG_THIN -e LTO_NONE ;;
+            *)    : ;;
+          esac
+
+          make LLVM=1 ARCH=arm64 O=out olddefconfig
+
+      - name: Prepare kernel for external modules
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        working-directory: ks
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          make LLVM=1 ARCH=arm64 O=out modules_prepare
+
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Build ACK kernel base
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        working-directory: ks
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          make LLVM=1 ARCH=arm64 O=out -j$(nproc)
+
+      - name: Save Kernel & Clang Cache
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ks
+            clang
+          key: ${{ steps.cache-kernel.outputs.cache-primary-key || format('gki-kernel-{0}-{1}-{2}-{3}', github.event.inputs.kcommit, github.event.inputs.clang_ver, github.event.inputs.lto, github.event.inputs.btf) }}
+
+      - name: Build SCSC WLAN (MX140) driver
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          cd src/drivers/net/wireless/scsc
+
+          echo "Building scsc_wlan.ko against prepared kernel..."
+          make -j$(nproc) -C "$GITHUB_WORKSPACE/ks/out" M="$(pwd)" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 CC=clang LD=ld.lld \
+            modules
+
+          if [ ! -f "scsc_wlan.ko" ]; then
+            echo "::error::Failed to build scsc_wlan.ko!"
+            exit 1
+          fi
+          ls -la scsc_wlan.ko
+
+      - name: Show module_layout CRC
+        if: always()
+        working-directory: ks
+        run: |
+          echo "=== module_layout CRC ==="
+          grep -w module_layout out/Module.symvers || echo "not found"
+
+      - name: Package Magisk/KernelSU module
+        id: pkg
+        run: |
+          set -e
+          COMMIT="${{ github.event.inputs.kcommit }}"
+          SHORT="$(echo "$COMMIT" | cut -c1-12)"
+          PKG="pkg"
+          rm -rf "$PKG"
+          mkdir -p "$PKG/modules" "$PKG/META-INF/com/google/android"
+
+          # Copy compiled scsc_wlan.ko
+          cp src/drivers/net/wireless/scsc/scsc_wlan.ko "$PKG/modules/"
+          cp ks/out/Module.symvers "$PKG/modules/" 2>/dev/null || true
+
+          # module.prop
+          cat > "$PKG/module.prop" <<PROP
+          id=samsung_mx140_monitor_${SHORT}
+          name=Samsung Exynos 1380 (MX140) Monitor Mode
+          version=${SHORT}
+          versionCode=1
+          author=Rian-yes
+          description=Replaces stock scsc_wlan with monitor-mode + raw-injection patched driver on Samsung Exynos 1380. Supports wlan0mon.
+          PROP
+          echo "actionIcon=" >> "$PKG/module.prop"
+
+          # Scripts from packaging-mx140
+          cp packaging-mx140/service.sh "$PKG/service.sh"
+          cp packaging-mx140/action.sh "$PKG/action.sh"
+          cp packaging-mx140/uninstall.sh "$PKG/uninstall.sh"
+          cp packaging-mx140/META-INF/com/google/android/update-binary "$PKG/META-INF/com/google/android/"
+          cp packaging-mx140/META-INF/com/google/android/updater-script "$PKG/META-INF/com/google/android/"
+          chmod 755 "$PKG/service.sh" "$PKG/uninstall.sh" "$PKG/action.sh" "$PKG/META-INF/com/google/android/update-binary"
+
+          echo "module tree ready:"
+          find "$PKG" -maxdepth 2 -type f | sort
+          echo "zipname=samsung-mx140-monitor-${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Magisk module (flashable as-is)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.zipname || 'samsung-mx140-monitor-module' }}
+          path: pkg/
+
+      - name: Upload raw scsc_wlan.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: scsc_wlan_ko
+          path: src/drivers/net/wireless/scsc/scsc_wlan.ko

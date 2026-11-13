@@ -1,0 +1,7 @@
+#!/sbin/sh
+# Magisk/KernelSU installer shim
+umask 022
+OUTFD=$2; ZIP=$3
+. /data/adb/magisk/util_functions.sh 2>/dev/null || true
+install_module
+exit 0
