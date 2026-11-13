@@ -42,6 +42,10 @@ ccflags-y += -DCONFIG_SCSC_WLAN_TPUT_MONITOR=1
 ccflags-y += -DCONFIG_SCSC_WLAN_CUSTOM_TX_POWER=1
 ccflags-y += -DCONFIG_SCSC_WLAN_TAS=1
 ccflags-y += -DCONFIG_SCSC_PRINTK=1
+ccflags-y += -DCONFIG_SCSC_DEBUG_COMPATIBILITY=1
+ccflags-y += -DCONFIG_SCSC_CORE_CM=1
+ccflags-y += -DCONFIG_SCSC_CORE=1
+ccflags-y += -DCONFIG_SCSC_INDEPENDENT_SUBSYSTEM=1
 
 obj-m := scsc_wlan.o
 
