@@ -459,6 +459,8 @@ static int slsi_net_stop(struct net_device *dev)
 	if (slsi_wake_lock_active(&ndev_vif->wlan_wl_sae))
 		slsi_wake_unlock(&ndev_vif->wlan_wl_sae);
 	slsi_wake_lock(&sdev->wlan_wl);
+	cancel_work_sync(&ndev_vif->monitor_tx_work);
+	skb_queue_purge(&ndev_vif->monitor_tx_queue);
 	netif_tx_stop_all_queues(dev);
 	sdev->initial_scan = false;
 	ndev_vif->acs = false;
@@ -486,16 +488,6 @@ static int slsi_net_stop(struct net_device *dev)
 static int __slsi_net_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 {
 	SLSI_NET_DBG4(dev, SLSI_NETDEV, "IOCTL cmd:0x%.4x\n", cmd);
-
-	/* Support Wireless Extensions for monitor mode tools (airodump-ng, aireplay-ng) */
-	if (cmd == 0x8B06 /* SIOCSIWMODE */) {
-		return 0;
-	}
-	if (cmd == 0x8B07 /* SIOCGIWMODE */) {
-		int *mode = (int *)&rq->ifr_ifru;
-		*mode = 6; /* IW_MODE_MONITOR */
-		return 0;
-	}
 
 	if (cmd == SIOCDEVPRIVATE + 2) { /* 0x89f0 + 2 from wpa_supplicant */
 		return slsi_ioctl(dev, rq, cmd);
@@ -1066,6 +1058,43 @@ void slsi_tdls_move_packets(struct slsi_dev *sdev, struct net_device *dev,
  *    the available space and WAKING them up again when more free buffers
  *    would have arrived.
  */
+static void slsi_monitor_tx_work(struct work_struct *work)
+{
+	struct netdev_vif *ndev_vif = container_of(work, struct netdev_vif, monitor_tx_work);
+	struct slsi_dev   *sdev = ndev_vif->sdev;
+	struct net_device *dev = ndev_vif->wdev.netdev;
+	struct sk_buff    *skb;
+
+	if (!dev)
+		return;
+
+	while ((skb = skb_dequeue(&ndev_vif->monitor_tx_queue)) != NULL) {
+		const u8 *payload = skb->data;
+		int payload_len = skb->len;
+
+		/* Strip radiotap header if present to extract raw 802.11 frame payload */
+		if (dev->type == ARPHRD_IEEE80211_RADIOTAP && payload_len >= 4 && payload[0] == 0) {
+			u16 rt_len = payload[2] | (payload[3] << 8);
+			if (rt_len < payload_len) {
+				payload += rt_len;
+				payload_len -= rt_len;
+			}
+		}
+
+		/* Sleep-safe in workqueue (kworker process) context */
+		SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
+		if (ndev_vif->activated) {
+			slsi_mlme_send_frame_mgmt(sdev, dev, payload, payload_len,
+						  FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME,
+						  FAPI_MESSAGETYPE_IEEE80211_ACTION,
+						  slsi_tx_mgmt_host_tag(sdev), 0, 0, 0);
+		}
+		SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
+
+		dev_kfree_skb_any(skb);
+	}
+}
+
 static netdev_tx_t slsi_net_hw_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct netdev_vif *ndev_vif = netdev_priv(dev);
@@ -1090,25 +1119,10 @@ static netdev_tx_t slsi_net_hw_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	/* Raw 802.11 Frame Injection for Monitor Mode (e.g. wlan0mon / aireplay-ng) */
 	if (ndev_vif->vif_type == FAPI_VIFTYPE_MONITOR || ndev_vif->iftype == NL80211_IFTYPE_MONITOR) {
-		const u8 *payload = skb->data;
-		int payload_len = skb->len;
-
-		/* Strip radiotap header if present to get the 802.11 frame payload */
-		if (dev->type == ARPHRD_IEEE80211_RADIOTAP && payload_len >= 4 && payload[0] == 0) {
-			u16 rt_len = payload[2] | (payload[3] << 8);
-			if (rt_len < payload_len) {
-				payload += rt_len;
-				payload_len -= rt_len;
-			}
-		}
-
-		r = slsi_mlme_send_frame_mgmt(sdev, dev, payload, payload_len,
-					      FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME,
-					      FAPI_MESSAGETYPE_IEEE80211_ACTION,
-					      slsi_tx_mgmt_host_tag(sdev), 0, 0, 0);
-		dev_kfree_skb_any(skb);
+		skb_queue_tail(&ndev_vif->monitor_tx_queue, skb);
+		schedule_work(&ndev_vif->monitor_tx_work);
 		slsi_wake_unlock(&sdev->wlan_wl);
-		return r ? NETDEV_TX_BUSY : NETDEV_TX_OK;
+		return NETDEV_TX_OK;
 	}
 
 	/* Check for misaligned (oddly aligned) data.
@@ -1369,9 +1383,10 @@ static const struct net_device_ops slsi_netdev_ops = {
 	.ndo_open         = slsi_net_open,
 	.ndo_stop         = slsi_net_stop,
 	.ndo_start_xmit   = slsi_net_hw_xmit,
-	.ndo_do_ioctl     = slsi_net_ioctl,
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
-        .ndo_siocdevprivate = slsi_net_prv_ioctl,
+	.ndo_siocdevprivate = slsi_net_prv_ioctl,
+#else
+	.ndo_do_ioctl     = slsi_net_ioctl,
 #endif
 #ifndef CONFIG_WLBT_WARN_ON
 	.ndo_tx_timeout   = slsi_net_tx_timeout,
@@ -1747,6 +1762,8 @@ int slsi_netif_add_locked(struct slsi_dev *sdev, const char *name, int ifnum)
 
 	ndev_vif->is_opt_out_packet = false;
 	INIT_WORK(&ndev_vif->update_pkt_filter_work, slsi_update_pkt_filter_work);
+	INIT_WORK(&ndev_vif->monitor_tx_work, slsi_monitor_tx_work);
+	skb_queue_head_init(&ndev_vif->monitor_tx_queue);
 	skb_queue_head_init(&ndev_vif->ba_complete);
 	slsi_sig_send_init(&ndev_vif->sig_wait);
 	ndev_vif->sdev = sdev;
@@ -2124,6 +2141,8 @@ void slsi_netif_remove_locked(struct slsi_dev *sdev, struct net_device *dev, boo
 #endif
 	slsi_netif_rps_map_clear(dev);
 #endif
+	cancel_work_sync(&ndev_vif->monitor_tx_work);
+	skb_queue_purge(&ndev_vif->monitor_tx_queue);
 	cancel_delayed_work(&ndev_vif->scan_timeout_work);
 	ndev_vif->scan[SLSI_SCAN_HW_ID].requeue_timeout_work = false;
 #ifndef CONFIG_SCSC_WLAN_RX_NAPI

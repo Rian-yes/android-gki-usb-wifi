@@ -1243,6 +1243,8 @@ struct netdev_vif {
 	int grace_period;
 	bool sap_ax_mode;
 	bool p2p_ax_mode;
+	struct work_struct                      monitor_tx_work;
+	struct sk_buff_head                     monitor_tx_queue;
 };
 
 struct slsi_802_11d_reg_domain {
