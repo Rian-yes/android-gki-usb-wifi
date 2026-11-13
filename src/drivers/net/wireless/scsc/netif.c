@@ -459,29 +459,6 @@ static int slsi_net_stop(struct net_device *dev)
 	if (slsi_wake_lock_active(&ndev_vif->wlan_wl_sae))
 		slsi_wake_unlock(&ndev_vif->wlan_wl_sae);
 	slsi_wake_lock(&sdev->wlan_wl);
-
-	/* Raw 802.11 Frame Injection for Monitor Mode (e.g. wlan0mon / aireplay-ng) */
-	if (ndev_vif->vif_type == FAPI_VIFTYPE_MONITOR || ndev_vif->iftype == NL80211_IFTYPE_MONITOR) {
-		const u8 *payload = skb->data;
-		int payload_len = skb->len;
-
-		/* Strip radiotap header if present to get the 802.11 frame payload */
-		if (dev->type == ARPHRD_IEEE80211_RADIOTAP && payload_len >= 4 && payload[0] == 0) {
-			u16 rt_len = payload[2] | (payload[3] << 8);
-			if (rt_len < payload_len) {
-				payload += rt_len;
-				payload_len -= rt_len;
-			}
-		}
-
-		r = slsi_mlme_send_frame_mgmt(sdev, dev, payload, payload_len,
-					      FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME,
-					      FAPI_MESSAGETYPE_IEEE80211_ACTION,
-					      slsi_tx_mgmt_host_tag(sdev), 0, 0, 0);
-		dev_kfree_skb_any(skb);
-		slsi_wake_unlock(&sdev->wlan_wl);
-		return r ? NETDEV_TX_BUSY : NETDEV_TX_OK;
-	}
 	netif_tx_stop_all_queues(dev);
 	sdev->initial_scan = false;
 	ndev_vif->acs = false;
@@ -1100,6 +1077,29 @@ static netdev_tx_t slsi_net_hw_xmit(struct sk_buff *skb, struct net_device *dev)
 	enum slsi_traffic_q traffic_q = slsi_frame_priority_to_ac_queue(skb->priority);
 
 	slsi_wake_lock(&sdev->wlan_wl);
+
+	/* Raw 802.11 Frame Injection for Monitor Mode (e.g. wlan0mon / aireplay-ng) */
+	if (ndev_vif->vif_type == FAPI_VIFTYPE_MONITOR || ndev_vif->iftype == NL80211_IFTYPE_MONITOR) {
+		const u8 *payload = skb->data;
+		int payload_len = skb->len;
+
+		/* Strip radiotap header if present to get the 802.11 frame payload */
+		if (dev->type == ARPHRD_IEEE80211_RADIOTAP && payload_len >= 4 && payload[0] == 0) {
+			u16 rt_len = payload[2] | (payload[3] << 8);
+			if (rt_len < payload_len) {
+				payload += rt_len;
+				payload_len -= rt_len;
+			}
+		}
+
+		r = slsi_mlme_send_frame_mgmt(sdev, dev, payload, payload_len,
+					      FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME,
+					      FAPI_MESSAGETYPE_IEEE80211_ACTION,
+					      slsi_tx_mgmt_host_tag(sdev), 0, 0, 0);
+		dev_kfree_skb_any(skb);
+		slsi_wake_unlock(&sdev->wlan_wl);
+		return r ? NETDEV_TX_BUSY : NETDEV_TX_OK;
+	}
 
 	/* Check for misaligned (oddly aligned) data.
 	 * The f/w requires 16 bit aligned.
