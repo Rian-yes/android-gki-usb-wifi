@@ -20,19 +20,14 @@ n=0
 while [ "$(getprop sys.boot_completed)" != "1" ] && [ $n -lt 150 ]; do sleep 2; n=$((n+1)); done
 sleep 5
 
-# 2) Stage firmware in /data/vendor/fw with symlinks to stock vendor firmware
-# Keeps both Wi-Fi firmware and camera microcode available 24/7 without conflicts.
+# 2) Stage firmware in /data/vendor/fw
+# Keeps Wi-Fi firmware in /data with vendor_fw_file label for kernel access.
 FWDIR=/data/vendor/fw
 mkdir -p "$FWDIR/rtw88"
 if [ -d "$FW" ]; then
   cp -r "$FW"/* "$FWDIR/" 2>/dev/null
   cp -r "$FW"/* "$FWDIR/rtw88/" 2>/dev/null
 fi
-for f in /vendor/firmware/*; do
-  [ -e "$f" ] || continue
-  b=$(basename "$f")
-  [ -e "$FWDIR/$b" ] || ln -sf "$f" "$FWDIR/$b" 2>/dev/null
-done
 chmod -R 755 "$FWDIR"
 chcon -R -h u:object_r:vendor_fw_file:s0 "$FWDIR" 2>/dev/null
 log "firmware staged at $FWDIR"
@@ -46,10 +41,17 @@ echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
 echo 0 > /sys/bus/usb/drivers_autoprobe 2>/dev/null
 for m in "$KMOD"/mac80211.ko \
          "$KMOD"/rtw_core.ko \
+         "$KMOD"/rtw_88xxa.ko \
          "$KMOD"/rtw_8723x.ko \
          "$KMOD"/rtw_8723d.ko \
+         "$KMOD"/rtw_8821c.ko \
+         "$KMOD"/rtw_8822b.ko \
+         "$KMOD"/rtw_8822c.ko \
+         "$KMOD"/rtw_8812a.ko \
+         "$KMOD"/rtw_8814a.ko \
+         "$KMOD"/rtw_8821a.ko \
          "$KMOD"/rtw_usb.ko \
-         "$KMOD"/rtw_8723du.ko \
+         "$KMOD"/__DRV_KO__ \
          "$KMOD"/*.ko ; do
   [ -e "$m" ] || continue
   base=$(basename "$m" .ko); lsn=$(echo "$base" | tr '-' '_')
@@ -59,54 +61,60 @@ done
 # Re-enable autoprobe so the kernel natively auto-detects and binds on ANY hotplug!
 echo 1 > /sys/bus/usb/drivers_autoprobe 2>/dev/null
 
-# 5) If adapter is already plugged in at boot, bind all matching interfaces once
+# 5) If adapter is already plugged in at boot, bind with transient firmware switch
+bind_adapter() {
+  dev="$1"
+  log "found adapter $dev at boot, binding interfaces..."
+  ORIG_FW=$(cat /sys/module/firmware_class/parameters/path 2>/dev/null)
+  [ -z "$ORIG_FW" ] && ORIG_FW="/vendor/firmware"
+
+  echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+  echo "$FWDIR" > /sys/module/firmware_class/parameters/path 2>/dev/null
+
+  for iface in /sys/bus/usb/devices/${dev}:*; do
+    [ -d "$iface" ] || continue
+    echo "$(basename "$iface")" > "/sys/bus/usb/drivers/$DRV_NAME/bind" 2>/dev/null
+  done
+
+  sleep 2
+  echo "$ORIG_FW" > /sys/module/firmware_class/parameters/path 2>/dev/null
+  log "adapter $dev bound, firmware path restored to $ORIG_FW"
+}
+
+set_monitor() {
+  CHROOT_BIN=/data/data/com.termux/files/usr/bin/chroot
+  ROOTFS=/data/local/nhsystem/kali-arm64
+  if [ -x "/data/data/com.termux/files/usr/bin/iw" ]; then
+    export LD_LIBRARY_PATH=/data/data/com.termux/files/usr/lib
+    ip link set wlan1 down 2>/dev/null
+    /data/data/com.termux/files/usr/bin/iw dev wlan1 set type monitor 2>/dev/null
+    ip link set wlan1 up 2>/dev/null
+    log "wlan1 set to MONITOR mode via Termux iw"
+  elif [ -x "$CHROOT_BIN" ] && [ -e "$ROOTFS/usr/sbin/iw" ]; then
+    ip link set wlan1 down 2>/dev/null
+    "$CHROOT_BIN" "$ROOTFS" /usr/sbin/iw dev wlan1 set type monitor 2>/dev/null
+    ip link set wlan1 up 2>/dev/null
+    log "wlan1 set to MONITOR mode via Kali chroot"
+  fi
+}
+
+dev=""
 for d in /sys/bus/usb/devices/*/idProduct; do
   dir=$(dirname "$d"); [ -f "$dir/idVendor" ] || continue
   if [ "$(cat "$dir/idVendor" 2>/dev/null):$(cat "$d" 2>/dev/null)" = "$USB_ID" ]; then
-    dev=$(basename "$dir")
-    for iface in /sys/bus/usb/devices/${dev}:*; do
-      [ -d "$iface" ] || continue
-      echo "$(basename "$iface")" > "/sys/bus/usb/drivers/$DRV_NAME/bind" 2>/dev/null
-    done
-    log "bound adapter $dev"
-    break
+    dev=$(basename "$dir"); break
   fi
 done
 
-# 6) Set monitor mode once wlan1 exists
-CHROOT_BIN=/data/data/com.termux/files/usr/bin/chroot
-ROOTFS=/data/local/nhsystem/kali-arm64
-
-set_monitor_bg() {
-  (
-    i=0
-    while [ $i -lt 60 ]; do
-      if ip link show wlan1 >/dev/null 2>&1; then
-        if [ -x "/data/data/com.termux/files/usr/bin/iw" ]; then
-          export LD_LIBRARY_PATH=/data/data/com.termux/files/usr/lib
-          ip link set wlan1 down 2>/dev/null
-          /data/data/com.termux/files/usr/bin/iw dev wlan1 set type monitor 2>/dev/null
-          ip link set wlan1 up 2>/dev/null
-          log "wlan1 set to MONITOR mode via Termux iw"
-          return 0
-        elif [ -x "$CHROOT_BIN" ] && [ -e "$ROOTFS/usr/sbin/iw" ]; then
-          ip link set wlan1 down 2>/dev/null
-          "$CHROOT_BIN" "$ROOTFS" /usr/sbin/iw dev wlan1 set type monitor 2>/dev/null
-          ip link set wlan1 up 2>/dev/null
-          log "wlan1 set to MONITOR mode via Kali chroot"
-          return 0
-        fi
-      fi
-      sleep 2; i=$((i+1))
-    done
-  ) &
-}
-
-AUTOMON="$MODDIR/automonitor"
-[ -f "$AUTOMON" ] || echo 1 > "$AUTOMON"
-if [ "$(cat "$AUTOMON" 2>/dev/null)" = "1" ]; then
-  set_monitor_bg
-  log "monitor mode: auto-enable requested (background)"
+if [ -n "$dev" ]; then
+  bind_adapter "$dev"
+  AUTOMON="$MODDIR/automonitor"
+  [ -f "$AUTOMON" ] || echo 1 > "$AUTOMON"
+  if [ "$(cat "$AUTOMON" 2>/dev/null)" = "1" ] && ip link show wlan1 >/dev/null 2>&1; then
+    set_monitor
+  fi
+else
+  log "adapter not attached at boot; plug in and press Action in KernelSU"
 fi
 
-log "service.sh complete - native kernel USB hot-reload active"
+log "service.sh complete - one-shot init done, zero background processes"

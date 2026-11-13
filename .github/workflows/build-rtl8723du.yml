@@ -1,18 +1,18 @@
-name: Build RTL8723DU Wi-Fi (KernelSU / Magisk)
+name: Build Realtek RTW88 Wi-Fi (parametrized)
 
 on:
   workflow_dispatch:
     inputs:
       kbranch:
-        description: "ACK branch matching your kernel"
+        description: "ACK branch matching your kernel: android12-5.10 | android13-5.15 | android14-6.1 | android15-6.6"
         required: true
         default: "android13-5.15"
       kcommit:
-        description: "Exact ACK commit"
+        description: "Exact ACK commit (COMMIT_SHORT / full hash). Overrides kbranch tip if set."
         required: true
         default: "e787d6ac4af04c06a0120ad773820d43f9b851a9"
       clang_ver:
-        description: "Android Clang version"
+        description: "Android Clang version (e.g. clang-r450784d). See device-profile.txt / notes."
         required: true
         default: "clang-r450784d"
       btf:
@@ -20,9 +20,13 @@ on:
         required: true
         default: "y"
       lto:
-        description: "LTO mode: full | thin | none"
+        description: "LTO mode to match device: full | thin | none"
         required: true
         default: "thin"
+      driver:
+        description: "RTW88 driver: rtl8723du | rtl8821cu | rtl8822bu | rtl8822cu | rtl8812au | rtl8814au | rtl8821au | all"
+        required: true
+        default: "rtl8723du"
       oot_repo:
         description: "Git URL of the RTW88 driver repo"
         required: true
@@ -46,7 +50,7 @@ jobs:
           echo "clang   = ${{ github.event.inputs.clang_ver }}"
           echo "btf     = ${{ github.event.inputs.btf }}"
           echo "lto     = ${{ github.event.inputs.lto }}"
-          echo "driver  = rtl8723du (rtw88)"
+          echo "driver  = ${{ github.event.inputs.driver }} (rtw88)"
           echo "repo    = ${{ github.event.inputs.oot_repo }} @ ${{ github.event.inputs.oot_branch }}"
 
       - name: Free disk space
@@ -143,7 +147,7 @@ jobs:
             done
             return 1
           }
-          for BR in android13-release android14-release android12-release android15-release main master; do
+          for BR in android13-release android14-release android12-release android15-release android16-release main master; do
             URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/$BR/$CV.tar.gz"
             echo "Trying $BR ..."
             if fetch "$URL"; then
@@ -219,6 +223,7 @@ jobs:
 
       - name: Build RTW88 driver
         env:
+          DRIVER: ${{ github.event.inputs.driver }}
           OOT_REPO: ${{ github.event.inputs.oot_repo }}
           OOT_BRANCH: ${{ github.event.inputs.oot_branch }}
         run: |
@@ -227,13 +232,11 @@ jobs:
           git clone --depth 1 "$OOT_REPO" oot
           cd oot
 
-          echo "Applying 5.15 compatibility patches..."
-          # Replace 5.17+ device_get_mac_address with 1 so efuse fallback works cleanly
+          echo "Applying 5.15+ compatibility patches..."
           sed -i 's/device_get_mac_address([^)]*)/1/g' main.c 2>/dev/null || true
-          # Replace 6.13+ ieee80211_purge_tx_queue in usb.c with skb_queue_purge
           sed -i 's/ieee80211_purge_tx_queue(rtwdev->hw, &txcb->tx_ack_queue);/skb_queue_purge(\&txcb->tx_ack_queue);/g' usb.c 2>/dev/null || true
 
-          echo "Writing targeted Makefile for RTL8723DU..."
+          echo "Writing targeted Makefile for $DRIVER..."
           cat > Makefile << 'EOF'
           ccflags-y += -O2 -std=gnu11 -Wno-declaration-after-statement -Wno-error
           ccflags-y += -DCONFIG_RTW88_LEDS=1
@@ -241,14 +244,97 @@ jobs:
           ccflags-y += -DCONFIG_RTW88_DEBUGFS=1
           ccflags-y += -D__CHECK_ENDIAN__
 
-          obj-m := rtw_core.o rtw_8723d.o rtw_8723du.o rtw_8723x.o rtw_usb.o
-
+          obj-m := rtw_core.o rtw_usb.o
           rtw_core-objs := main.o led.o mac80211.o util.o debug.o tx.o rx.o mac.o phy.o coex.o efuse.o fw.o ps.o sec.o bf.o regd.o sar.o wow.o
+          rtw_usb-objs  := usb.o
+          EOF
+
+          case "$DRIVER" in
+            rtl8723du)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8723d.o rtw_8723du.o rtw_8723x.o
           rtw_8723d-objs  := rtw8723d.o rtw8723d_table.o
           rtw_8723du-objs := rtw8723du.o
           rtw_8723x-objs  := rtw8723x.o
-          rtw_usb-objs    := usb.o
           EOF
+              ;;
+            rtl8821cu)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8821c.o rtw_8821cu.o
+          rtw_8821c-objs  := rtw8821c.o rtw8821c_table.o
+          rtw_8821cu-objs := rtw8821cu.o
+          EOF
+              ;;
+            rtl8822bu)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8822b.o rtw_8822bu.o
+          rtw_8822b-objs  := rtw8822b.o rtw8822b_table.o
+          rtw_8822bu-objs := rtw8822bu.o
+          EOF
+              ;;
+            rtl8822cu)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8822c.o rtw_8822cu.o
+          rtw_8822c-objs  := rtw8822c.o rtw8822c_table.o
+          rtw_8822cu-objs := rtw8822cu.o
+          EOF
+              ;;
+            rtl8812au)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8812a.o rtw_8812au.o rtw_88xxa.o
+          rtw_8812a-objs  := rtw8812a.o rtw8812a_table.o
+          rtw_8812au-objs := rtw8812au.o
+          rtw_88xxa-objs  := rtw88xxa.o
+          EOF
+              ;;
+            rtl8814au)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8814a.o rtw_8814au.o rtw_88xxa.o
+          rtw_8814a-objs  := rtw8814a.o rtw8814a_table.o
+          rtw_8814au-objs := rtw8814au.o
+          rtw_88xxa-objs  := rtw88xxa.o
+          EOF
+              ;;
+            rtl8821au)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8821a.o rtw_8821au.o rtw_88xxa.o
+          rtw_8821a-objs  := rtw8821a.o rtw8821a_table.o
+          rtw_8821au-objs := rtw8821au.o
+          rtw_88xxa-objs  := rtw88xxa.o
+          EOF
+              ;;
+            all)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8723d.o rtw_8723du.o rtw_8723x.o \
+                   rtw_8821c.o rtw_8821cu.o \
+                   rtw_8822b.o rtw_8822bu.o \
+                   rtw_8822c.o rtw_8822cu.o \
+                   rtw_8812a.o rtw_8812au.o \
+                   rtw_8814a.o rtw_8814au.o \
+                   rtw_8821a.o rtw_8821au.o rtw_88xxa.o
+          rtw_8723d-objs  := rtw8723d.o rtw8723d_table.o
+          rtw_8723du-objs := rtw8723du.o
+          rtw_8723x-objs  := rtw8723x.o
+          rtw_8821c-objs  := rtw8821c.o rtw8821c_table.o
+          rtw_8821cu-objs := rtw8821cu.o
+          rtw_8822b-objs  := rtw8822b.o rtw8822b_table.o
+          rtw_8822bu-objs := rtw8822bu.o
+          rtw_8822c-objs  := rtw8822c.o rtw8822c_table.o
+          rtw_8822cu-objs := rtw8822cu.o
+          rtw_8812a-objs  := rtw8812a.o rtw8812a_table.o
+          rtw_8812au-objs := rtw8812au.o
+          rtw_8814a-objs  := rtw8814a.o rtw8814a_table.o
+          rtw_8814au-objs := rtw8814au.o
+          rtw_8821a-objs  := rtw8821a.o rtw8821a_table.o
+          rtw_8821au-objs := rtw8821au.o
+          rtw_88xxa-objs  := rtw88xxa.o
+          EOF
+              ;;
+            *)
+              echo "::error::Unknown RTW88 driver $DRIVER"
+              exit 1
+              ;;
+          esac
 
           echo "Building RTW88 modules against prepared kernel..."
           make -j$(nproc) -C "$GITHUB_WORKSPACE/ks/out" M="$(pwd)" \
@@ -286,6 +372,31 @@ jobs:
           set -e
           COMMIT="${{ github.event.inputs.kcommit }}"
           SHORT="$(echo "$COMMIT" | cut -c1-12)"
+          DRIVER="${{ github.event.inputs.driver }}"
+
+          case "$DRIVER" in
+            rtl8723du)
+              LEAF="rtw_8723du.ko"; DRVNAME="rtw_8723du"; USBID="0bda:d723" ;;
+            rtl8821cu)
+              LEAF="rtw_8821cu.ko"; DRVNAME="rtw_8821cu"; USBID="0bda:c821" ;;
+            rtl8822bu)
+              LEAF="rtw_8822bu.ko"; DRVNAME="rtw_8822bu"; USBID="0bda:b82c" ;;
+            rtl8822cu)
+              LEAF="rtw_8822cu.ko"; DRVNAME="rtw_8822cu"; USBID="0bda:c82c" ;;
+            rtl8812au)
+              LEAF="rtw_8812au.ko"; DRVNAME="rtw_8812au"; USBID="0bda:8812" ;;
+            rtl8814au)
+              LEAF="rtw_8814au.ko"; DRVNAME="rtw_8814au"; USBID="0bda:8813" ;;
+            rtl8821au)
+              LEAF="rtw_8821au.ko"; DRVNAME="rtw_8821au"; USBID="0bda:8811" ;;
+            all)
+              LEAF="rtw_8723du.ko"; DRVNAME="rtw_8723du"; USBID="0bda:d723" ;;
+            *)
+              echo "::error::Unsupported driver $DRIVER for packaging"
+              exit 1
+              ;;
+          esac
+
           PKG="pkg"
           rm -rf "$PKG"; mkdir -p "$PKG/modules" "$PKG/firmware/rtw88" "$PKG/META-INF/com/google/android"
 
@@ -300,28 +411,26 @@ jobs:
             cp oot/firmware/*.bin "$PKG/firmware/" 2>/dev/null || true
           fi
 
-          LEAF="rtw_8723du.ko"
-          DRVNAME="rtw_8723du"
-          USBID="0bda:d723"
-
           # module.prop following official format
           cat > "$PKG/module.prop" <<PROP
-          id=gki_usb_wifi_${SHORT}_rtl8723du
-          name=GKI USB Wi-Fi (RTL8723DU)
+          id=gki_usb_wifi_${SHORT}_${DRIVER}
+          name=GKI USB Wi-Fi (${DRIVER})
           version=${SHORT}
           versionCode=1
           author=markatsos, Rian-yes
-          description=Loads RTL8723DU (RTW88) on kernel ACK commit ${SHORT}. Auto monitor-mode on plug-in.
+          description=Loads ${DRIVER} (RTW88) on kernel ACK commit ${SHORT}. One-press Action button initialization.
           PROP
           echo "actionIcon=" >> "$PKG/module.prop"
 
-          # service.sh from template, with placeholders filled
+          # service.sh & action.sh with placeholders filled
           sed -e "s|__USB_ID__|$USBID|" \
               -e "s|__DRV_KO__|$LEAF|" \
               -e "s|__DRV_NAME__|$DRVNAME|" \
               packaging/service.sh > "$PKG/service.sh"
+          sed -e "s|__USB_ID__|$USBID|" \
+              -e "s|__DRV_NAME__|$DRVNAME|" \
+              packaging/action.sh > "$PKG/action.sh"
           cp packaging/uninstall.sh "$PKG/uninstall.sh"
-          cp packaging/action.sh "$PKG/action.sh"
           chmod 755 "$PKG/service.sh" "$PKG/uninstall.sh" "$PKG/action.sh"
 
           # Official Magisk/KernelSU/APatch installer shim
@@ -338,7 +447,7 @@ jobs:
 
           echo "module tree ready:"
           find "$PKG" -maxdepth 2 -type f | sort
-          echo "zipname=gki-usb-wifi-${SHORT}-rtl8723du" >> "$GITHUB_OUTPUT"
+          echo "zipname=gki-usb-wifi-${SHORT}-${DRIVER}" >> "$GITHUB_OUTPUT"
 
       - name: Upload Magisk module (flashable as-is)
         if: always()
