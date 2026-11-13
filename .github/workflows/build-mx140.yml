@@ -194,6 +194,7 @@ jobs:
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 CC=clang LD=ld.lld \
+            KBUILD_MODPOST_WARN=1 \
             modules
 
           if [ ! -f "scsc_wlan.ko" ]; then
@@ -219,8 +220,8 @@ jobs:
           rm -rf "$PKG"
           mkdir -p "$PKG/modules" "$PKG/META-INF/com/google/android"
 
-          # Copy compiled scsc_wlan.ko
-          cp src/drivers/net/wireless/scsc/scsc_wlan.ko "$PKG/modules/"
+          # Copy compiled modules
+          cp src/drivers/net/wireless/scsc/*.ko "$PKG/modules/"
           cp ks/out/Module.symvers "$PKG/modules/" 2>/dev/null || true
 
           # module.prop

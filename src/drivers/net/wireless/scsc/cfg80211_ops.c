@@ -2133,11 +2133,10 @@ int slsi_set_monitor_channel(struct wiphy *wiphy, struct cfg80211_chan_def *chan
 	struct slsi_dev *sdev = SDEV_FROM_WIPHY(wiphy);
 	struct net_device *dev;
 	struct netdev_vif *ndev_vif;
+	struct net_device *mon_dev = NULL;
+	int i;
 
 	SLSI_DBG1(sdev, SLSI_CFG80211, "channel (freq:%u)\n", chandef->chan->center_freq);
-
-	int i;
-	struct net_device *mon_dev = NULL;
 
 	rcu_read_lock();
 	/* Find active monitor interface (e.g. wlan0mon, mon0, or wlan0) */

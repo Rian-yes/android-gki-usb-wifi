@@ -56,7 +56,7 @@ ccflags-y += -DCONFIG_SCSC_WIFILOGGER=1
 ccflags-y += -DCONFIG_SCSC_WLBTD=1
 ccflags-y += -DCONFIG_SCSC_COMMON_HCF=1
 
-obj-m := scsc_wlan.o
+obj-m := scsc_wlan.o scsc_wifilogger.o
 
 # Official Samsung object list for scsc_wlan
 scsc_wlan-y := hip4.o hip4_sampler.o mbulk.o dev.o cfg80211_ops.o netif.o rx.o tx.o ba.o ba_replay.o \
@@ -66,3 +66,12 @@ scsc_wlan-y := hip4.o hip4_sampler.o mbulk.o dev.o cfg80211_ops.o netif.o rx.o t
 	load_manager.o dpd_mmap.o reg_info.o log2us.o ini_config.o tdls_manager.o \
 	scsc_wlan_mmap.o qsfs.o slsi_tracepoint_debug.o hip.o cm_if.o nl80211_vendor.o \
 	nl80211_vendor_nan.o mlme_nan.o
+
+# Official Samsung object list for scsc_wifilogger
+scsc_wifilogger-y := scsc_wifilogger_api.o \
+                     scsc_wifilogger_internal.o \
+                     scsc_wifilogger_core.o \
+                     scsc_wifilogger_module.o \
+                     scsc_wifilogger_ring_connectivity.o \
+                     scsc_wifilogger_ring_wakelock.o \
+                     scsc_wifilogger_ring_pktfate.o
