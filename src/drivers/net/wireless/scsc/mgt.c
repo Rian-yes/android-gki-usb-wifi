@@ -704,10 +704,8 @@ static void write_softap_info_file(struct slsi_dev *sdev)
 
 	if (!fp)  {
 		SLSI_WARN(sdev, "%s doesn't exist\n", filepath);
-		buf = NULL;
 	} else if (IS_ERR(fp)) {
 		SLSI_WARN(sdev, "%s open returned error %d\n", filepath, IS_ERR(fp));
-		buf = NULL;
 	} else {
 		kernel_write(fp, buf, strlen(buf), 0);
 	}
