@@ -510,6 +510,8 @@ jobs:
           chmod 755 "$PKG/service.sh" "$PKG/uninstall.sh" "$PKG/action.sh"
           [ -f "scripts/check-bt-symbols.sh" ] && cp "scripts/check-bt-symbols.sh" "$PKG/" && chmod 755 "$PKG/check-bt-symbols.sh" || true
           [ -f "needed-symbols.txt" ] && cp "needed-symbols.txt" "$PKG/" || true
+          mkdir -p "$PKG/bin"
+          [ -f "packaging/bin/btup" ] && cp "packaging/bin/btup" "$PKG/bin/" && chmod 755 "$PKG/bin/btup" || true
 
           # Official Magisk/KernelSU/APatch installer shim
           cat > "$PKG/META-INF/com/google/android/update-binary" <<'UB'

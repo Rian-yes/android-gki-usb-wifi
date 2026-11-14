@@ -83,21 +83,20 @@ bind_adapter() {
     [ -d /sys/bus/usb/drivers/btusb ] && echo "$ib" > /sys/bus/usb/drivers/btusb/bind 2>/dev/null
   done
 
-  # btrtl downloads rtl_bt/*.bin while hci0 powers on right after bind
+  # Bring up Bluetooth controller natively so btrtl loads rtl_bt firmware
+  if [ -x "$MODDIR/bin/btup" ]; then
+    "$MODDIR/bin/btup" up 0 >/dev/null 2>&1 || true
+  elif command -v hciconfig >/dev/null 2>&1; then
+    hciconfig hci0 up 2>/dev/null || true
+  fi
   sleep 2
-  for h in /sys/class/bluetooth/hci*; do
-    [ -d "$h" ] || continue
-    hname=$(basename "$h")
-    if command -v hciconfig >/dev/null 2>&1; then
-      hciconfig "$hname" up 2>/dev/null || true
-    elif [ -x /data/local/nhsystem/kali-arm64/usr/bin/hciconfig ]; then
-      chroot /data/local/nhsystem/kali-arm64 /usr/bin/hciconfig "$hname" up 2>/dev/null || true
-    fi
-  done
-  sleep 3
   echo "$ORIG_FW" > /sys/module/firmware_class/parameters/path 2>/dev/null
   log "adapter $dev bound, firmware path restored to $ORIG_FW"
-  log "bluetooth controllers: $(ls /sys/class/bluetooth 2>/dev/null | tr '\n' ' ')"
+  if [ -x "$MODDIR/bin/btup" ]; then
+    log "bluetooth: $("$MODDIR/bin/btup" status 0 2>/dev/null || echo 'down')"
+  else
+    log "bluetooth controllers: $(ls /sys/class/bluetooth 2>/dev/null | tr '\n' ' ')"
+  fi
 }
 
 set_monitor() {

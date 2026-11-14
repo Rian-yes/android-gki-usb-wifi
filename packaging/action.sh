@@ -31,29 +31,51 @@ if [ -z "$dev" ]; then
 fi
 
 # Step 0: Bluetooth half of the combo chip (btusb) - bind if no hci device yet
-if [ -d /sys/bus/usb/drivers/btusb ] && [ -z "$(ls /sys/class/bluetooth 2>/dev/null)" ]; then
-  echo "[*] Binding Bluetooth interfaces (btusb)..."
+need_bt_init=0
+if [ -d /sys/bus/usb/drivers/btusb ]; then
+  if [ -z "$(ls /sys/class/bluetooth 2>/dev/null)" ]; then
+    need_bt_init=1
+  elif [ -x "$MODDIR/bin/btup" ]; then
+    if ! "$MODDIR/bin/btup" status 0 >/dev/null 2>&1; then
+      need_bt_init=1
+    fi
+  elif command -v hciconfig >/dev/null 2>&1; then
+    if ! hciconfig hci0 2>/dev/null | grep -q "UP RUNNING"; then
+      need_bt_init=1
+    fi
+  fi
+fi
+
+if [ "$need_bt_init" = "1" ]; then
+  echo "[*] Initializing Bluetooth (btusb) & downloading firmware..."
   ORIG_FW=$(cat /sys/module/firmware_class/parameters/path 2>/dev/null)
   [ -z "$ORIG_FW" ] && ORIG_FW="/vendor/firmware"
   echo "$FWDIR" > /sys/module/firmware_class/parameters/path 2>/dev/null
   for iface in /sys/bus/usb/devices/${dev}:*; do
     [ -d "$iface" ] || continue
-    echo "$(basename "$iface")" > /sys/bus/usb/drivers/btusb/bind 2>/dev/null
+    [ -d "$iface/driver" ] || echo "$(basename "$iface")" > /sys/bus/usb/drivers/btusb/bind 2>/dev/null
   done
-  sleep 2
-  for h in /sys/class/bluetooth/hci*; do
-    [ -d "$h" ] || continue
-    hname=$(basename "$h")
-    if command -v hciconfig >/dev/null 2>&1; then
-      hciconfig "$hname" up 2>/dev/null || true
-    elif [ -x /data/local/nhsystem/kali-arm64/usr/bin/hciconfig ]; then
-      chroot /data/local/nhsystem/kali-arm64 /usr/bin/hciconfig "$hname" up 2>/dev/null || true
-    fi
-  done
+  sleep 1
+
+  if [ -x "$MODDIR/bin/btup" ]; then
+    "$MODDIR/bin/btup" up 0 >/dev/null 2>&1 || true
+  elif command -v hciconfig >/dev/null 2>&1; then
+    hciconfig hci0 up 2>/dev/null || true
+    hciconfig hci0 piscan 2>/dev/null || true
+    hciconfig hci0 sspmode 1 2>/dev/null || true
+  fi
   sleep 2
   echo "$ORIG_FW" > /sys/module/firmware_class/parameters/path 2>/dev/null
 fi
-if [ -n "$(ls /sys/class/bluetooth 2>/dev/null)" ]; then
+
+if [ -x "$MODDIR/bin/btup" ]; then
+  bt_stat=$("$MODDIR/bin/btup" status 0 2>/dev/null)
+  if [ $? -eq 0 ]; then
+    echo "[+] Bluetooth: $bt_stat"
+  else
+    echo "[-] Bluetooth: hci0 is DOWN"
+  fi
+elif [ -n "$(ls /sys/class/bluetooth 2>/dev/null)" ]; then
   echo "[+] Bluetooth: $(ls /sys/class/bluetooth | tr '\n' ' ')"
 else
   echo "[!] No hci device (check: dmesg | grep -iE 'btusb|rtl_bt')"
