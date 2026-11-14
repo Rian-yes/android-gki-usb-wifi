@@ -40,7 +40,17 @@ if [ -d /sys/bus/usb/drivers/btusb ] && [ -z "$(ls /sys/class/bluetooth 2>/dev/n
     [ -d "$iface" ] || continue
     echo "$(basename "$iface")" > /sys/bus/usb/drivers/btusb/bind 2>/dev/null
   done
-  sleep 5
+  sleep 2
+  for h in /sys/class/bluetooth/hci*; do
+    [ -d "$h" ] || continue
+    hname=$(basename "$h")
+    if command -v hciconfig >/dev/null 2>&1; then
+      hciconfig "$hname" up 2>/dev/null || true
+    elif [ -x /data/local/nhsystem/kali-arm64/usr/bin/hciconfig ]; then
+      chroot /data/local/nhsystem/kali-arm64 /usr/bin/hciconfig "$hname" up 2>/dev/null || true
+    fi
+  done
+  sleep 2
   echo "$ORIG_FW" > /sys/module/firmware_class/parameters/path 2>/dev/null
 fi
 if [ -n "$(ls /sys/class/bluetooth 2>/dev/null)" ]; then
