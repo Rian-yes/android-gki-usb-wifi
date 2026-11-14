@@ -490,11 +490,11 @@ jobs:
           # module.prop following official format
           cat > "$PKG/module.prop" <<PROP
           id=gki_usb_wifi_${SHORT}_${DRIVER}
-          name=GKI USB Wi-Fi (${DRIVER})
+          name=GKI USB Wi-Fi + Bluetooth (${DRIVER})
           version=${SHORT}
-          versionCode=1
+          versionCode=2
           author=markatsos, Rian-yes
-          description=Loads ${DRIVER} (RTW88) on kernel ACK commit ${SHORT}. One-press Action button initialization.
+          description=Loads ${DRIVER} (RTW88) Wi-Fi & Bluetooth (btusb) on ACK commit ${SHORT}. Auto-binds on boot and one-press Action button.
           PROP
           echo "actionIcon=" >> "$PKG/module.prop"
 
@@ -508,6 +508,8 @@ jobs:
               packaging/action.sh > "$PKG/action.sh"
           cp packaging/uninstall.sh "$PKG/uninstall.sh"
           chmod 755 "$PKG/service.sh" "$PKG/uninstall.sh" "$PKG/action.sh"
+          [ -f "scripts/check-bt-symbols.sh" ] && cp "scripts/check-bt-symbols.sh" "$PKG/" && chmod 755 "$PKG/check-bt-symbols.sh" || true
+          [ -f "needed-symbols.txt" ] && cp "needed-symbols.txt" "$PKG/" || true
 
           # Official Magisk/KernelSU/APatch installer shim
           cat > "$PKG/META-INF/com/google/android/update-binary" <<'UB'
