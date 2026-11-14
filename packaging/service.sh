@@ -52,6 +52,9 @@ for m in "$KMOD"/mac80211.ko \
          "$KMOD"/rtw_8821a.ko \
          "$KMOD"/rtw_usb.ko \
          "$KMOD"/__DRV_KO__ \
+         "$KMOD"/af_alg.ko "$KMOD"/algif_hash.ko "$KMOD"/algif_skcipher.ko "$KMOD"/algif_rng.ko \
+         "$KMOD"/btintel.ko "$KMOD"/btrtl.ko "$KMOD"/btusb.ko \
+         "$KMOD"/bnep.ko "$KMOD"/hci_vhci.ko \
          "$KMOD"/*.ko ; do
   [ -e "$m" ] || continue
   base=$(basename "$m" .ko); lsn=$(echo "$base" | tr '-' '_')
@@ -73,12 +76,18 @@ bind_adapter() {
 
   for iface in /sys/bus/usb/devices/${dev}:*; do
     [ -d "$iface" ] || continue
-    echo "$(basename "$iface")" > "/sys/bus/usb/drivers/$DRV_NAME/bind" 2>/dev/null
+    ib=$(basename "$iface")
+    # Wi-Fi interface -> rtw driver; Bluetooth interfaces -> btusb.
+    # A bind to the wrong driver is rejected harmlessly by the kernel.
+    echo "$ib" > "/sys/bus/usb/drivers/$DRV_NAME/bind" 2>/dev/null
+    [ -d /sys/bus/usb/drivers/btusb ] && echo "$ib" > /sys/bus/usb/drivers/btusb/bind 2>/dev/null
   done
 
-  sleep 2
+  # btrtl downloads rtl_bt/*.bin while hci0 powers on right after bind
+  sleep 5
   echo "$ORIG_FW" > /sys/module/firmware_class/parameters/path 2>/dev/null
   log "adapter $dev bound, firmware path restored to $ORIG_FW"
+  log "bluetooth controllers: $(ls /sys/class/bluetooth 2>/dev/null | tr '\n' ' ')"
 }
 
 set_monitor() {

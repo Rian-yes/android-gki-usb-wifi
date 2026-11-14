@@ -30,6 +30,25 @@ if [ -z "$dev" ]; then
   exit 0
 fi
 
+# Step 0: Bluetooth half of the combo chip (btusb) - bind if no hci device yet
+if [ -d /sys/bus/usb/drivers/btusb ] && [ -z "$(ls /sys/class/bluetooth 2>/dev/null)" ]; then
+  echo "[*] Binding Bluetooth interfaces (btusb)..."
+  ORIG_FW=$(cat /sys/module/firmware_class/parameters/path 2>/dev/null)
+  [ -z "$ORIG_FW" ] && ORIG_FW="/vendor/firmware"
+  echo "$FWDIR" > /sys/module/firmware_class/parameters/path 2>/dev/null
+  for iface in /sys/bus/usb/devices/${dev}:*; do
+    [ -d "$iface" ] || continue
+    echo "$(basename "$iface")" > /sys/bus/usb/drivers/btusb/bind 2>/dev/null
+  done
+  sleep 5
+  echo "$ORIG_FW" > /sys/module/firmware_class/parameters/path 2>/dev/null
+fi
+if [ -n "$(ls /sys/class/bluetooth 2>/dev/null)" ]; then
+  echo "[+] Bluetooth: $(ls /sys/class/bluetooth | tr '\n' ' ')"
+else
+  echo "[!] No hci device (check: dmesg | grep -iE 'btusb|rtl_bt')"
+fi
+
 # Step 1: Bind if wlan1 is not present
 if ! ip link show wlan1 >/dev/null 2>&1; then
   echo "[*] Initializing hardware & binding adapter ($dev)..."

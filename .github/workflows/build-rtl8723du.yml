@@ -107,7 +107,7 @@ jobs:
           path: |
             ks
             clang
-          key: gki-kernel-${{ github.event.inputs.kcommit }}-${{ github.event.inputs.clang_ver }}-${{ github.event.inputs.lto }}-${{ github.event.inputs.btf }}
+          key: gki-kernel-${{ github.event.inputs.kcommit }}-${{ github.event.inputs.clang_ver }}-${{ github.event.inputs.lto }}-${{ github.event.inputs.btf }}-bt1
 
       - name: Fetch kernel source (exact commit)
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -176,6 +176,40 @@ jobs:
             echo "CONFIG_MAC80211=m"
           } >> arch/arm64/configs/gki_defconfig
 
+          # Bluetooth for the RTL8723DU combo adapter (BT 4.2: BR/EDR + LE).
+          # Core options (BT, BT_LE, DEBUGFS, no MSFT/AOSP/LEDS...) must equal
+          # the device's built-in core; they are verified in a later step.
+          # Only separate modules are added: btusb (+btrtl, btintel via select),
+          # bnep (PAN/tethering), AF_ALG for BlueZ, hci_vhci.
+          cat >> arch/arm64/configs/gki_defconfig <<'BTCFG'
+          CONFIG_BT=y
+          CONFIG_BT_BREDR=y
+          CONFIG_BT_LE=y
+          CONFIG_BT_RFCOMM=y
+          CONFIG_BT_RFCOMM_TTY=y
+          CONFIG_BT_HIDP=y
+          CONFIG_BT_DEBUGFS=y
+          # CONFIG_BT_HS is not set
+          # CONFIG_BT_LEDS is not set
+          # CONFIG_BT_MSFTEXT is not set
+          # CONFIG_BT_AOSPEXT is not set
+          # CONFIG_BT_FEATURE_DEBUG is not set
+          # CONFIG_BT_6LOWPAN is not set
+          CONFIG_BT_HCIBTUSB=m
+          CONFIG_BT_HCIBTUSB_RTL=y
+          # CONFIG_BT_HCIBTUSB_BCM is not set
+          # CONFIG_BT_HCIBTUSB_MTK is not set
+          # CONFIG_BT_HCIBTUSB_AUTOSUSPEND is not set
+          CONFIG_BT_BNEP=m
+          CONFIG_BT_BNEP_MC_FILTER=y
+          CONFIG_BT_BNEP_PROTO_FILTER=y
+          CONFIG_BT_HCIVHCI=m
+          CONFIG_UHID=y
+          CONFIG_CRYPTO_USER_API_HASH=m
+          CONFIG_CRYPTO_USER_API_SKCIPHER=m
+          CONFIG_CRYPTO_USER_API_RNG=m
+          BTCFG
+
           make LLVM=1 ARCH=arm64 O=out gki_defconfig
 
           if [ "$BTF" != "y" ]; then
@@ -195,6 +229,30 @@ jobs:
         run: |
           export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
           make LLVM=1 ARCH=arm64 O=out modules_prepare
+
+      - name: Verify Bluetooth core config matches device
+        working-directory: ks
+        run: |
+          CFG=out/.config
+          DEV="$GITHUB_WORKSPACE/device/a356e-bt-core.config"
+          bad=0
+          # Options that change struct hci_dev / the core ABI must match the
+          # built-in core of the running kernel, or the modules misbehave.
+          for opt in BT BT_BREDR BT_LE BT_HS BT_LEDS BT_MSFTEXT BT_AOSPEXT BT_DEBUGFS BT_FEATURE_DEBUG; do
+            want=$(sed -n "s/^CONFIG_${opt}=\(.*\)$/\1/p" "$DEV")
+            [ -z "$want" ] && want=n
+            have=$(sed -n "s/^CONFIG_${opt}=\(.*\)$/\1/p" "$CFG")
+            [ -z "$have" ] && have=n
+            if [ "$want" = "$have" ]; then
+              echo "ok       $opt=$have"
+            else
+              echo "::error::BT core mismatch: $opt device=$want build=$have"
+              bad=1
+            fi
+          done
+          echo "--- Bluetooth/crypto modules this build will produce ---"
+          grep -E "^CONFIG_(BT_HCIBTUSB|BT_RTL|BT_INTEL|BT_BNEP|BT_HCIVHCI|CRYPTO_USER_API)" "$CFG" || true
+          [ "$bad" = 0 ] || exit 1
 
       - name: Add swap
         run: |
@@ -219,7 +277,7 @@ jobs:
           path: |
             ks
             clang
-          key: ${{ steps.cache-kernel.outputs.cache-primary-key || format('gki-kernel-{0}-{1}-{2}-{3}', github.event.inputs.kcommit, github.event.inputs.clang_ver, github.event.inputs.lto, github.event.inputs.btf) }}
+          key: ${{ steps.cache-kernel.outputs.cache-primary-key || format('gki-kernel-{0}-{1}-{2}-{3}-bt1', github.event.inputs.kcommit, github.event.inputs.clang_ver, github.event.inputs.lto, github.event.inputs.btf) }}
 
       - name: Build RTW88 driver
         env:
@@ -363,6 +421,11 @@ jobs:
           mkdir -p ko
           find ks/out -name "*.ko" \( -name "mac80211.ko" -o -name "cfg80211.ko" \) -exec cp {} ko/ \; || true
           find oot -name "*.ko" -exec cp {} ko/ \;
+          # Bluetooth + AF_ALG modules built in-tree (btusb, btrtl, btintel, bnep, ...)
+          for n in btusb btrtl btintel bnep hci_vhci af_alg algif_hash algif_skcipher algif_rng; do
+            f=$(find ks/out -name "$n.ko" | head -1)
+            if [ -n "$f" ]; then cp "$f" ko/; else echo "WARN: $n.ko not built"; fi
+          done
           cp ks/out/Module.symvers ko/ 2>/dev/null || true
           echo "--- collected ---"; ls -la ko/
 
@@ -410,6 +473,19 @@ jobs:
             cp oot/firmware/*.bin "$PKG/firmware/rtw88/" 2>/dev/null || true
             cp oot/firmware/*.bin "$PKG/firmware/" 2>/dev/null || true
           fi
+
+          # Bluetooth firmware for RTL8723D (btrtl needs BOTH files)
+          case "$DRIVER" in
+            rtl8723du|all)
+              mkdir -p "$PKG/firmware/rtl_bt"
+              LFBT="https://gitlab.com/kernel-firmware/linux-firmware/-/raw/main/rtl_bt"
+              for f in rtl8723d_fw.bin rtl8723d_config.bin; do
+                curl -fsSL --retry 3 "$LFBT/$f" -o "$PKG/firmware/rtl_bt/$f" \
+                  || curl -fsSL --retry 3 "$LFBT/rtl8821c_config.bin" -o "$PKG/firmware/rtl_bt/$f" \
+                  || { echo "::error::could not fetch Bluetooth firmware $f"; exit 1; }
+              done
+              ;;
+          esac
 
           # module.prop following official format
           cat > "$PKG/module.prop" <<PROP
