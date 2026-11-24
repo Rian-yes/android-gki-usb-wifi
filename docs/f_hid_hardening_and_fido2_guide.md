@@ -1,0 +1,319 @@
+# Universal Hardened USB HID Gadget (`f_hid`) & FIDO2 Security Key Guide
+
+This guide documents the engineering process, kernel driver fixes, ConfigFS gadget orchestration, and CTAP2 protocol implementation required to turn an Android device into a physical **FIDO2 / WebAuthn Hardware Security Key** that is hotplug-safe and reproducible on **any Android device** (Samsung, Google Pixel, Xiaomi, OnePlus, Motorola, etc.).
+
+---
+
+## 1. Architectural Overview
+
+```mermaid
+flowchart TD
+    subgraph Host ["PC / Host OS (Windows / Linux / macOS)"]
+        Browser["Web Browser (Chrome / Edge / Firefox)"]
+        WinHello["Windows Hello / WebAuthn API"]
+        HID_Driver["OS USB HID Driver (Usage Page 0xF1D0)"]
+        Browser --> WinHello
+        WinHello --> HID_Driver
+    end
+
+    USB_Cable["USB-C Cable (Hotplug / Disconnect / Power Reset)"]
+    HID_Driver <===> USB_Cable
+
+    subgraph Phone ["Android Device (GKI Linux Kernel)"]
+        USB_HW["USB Device Controller (DWC3 / MUSB / Chipidea)"]
+        USB_Cable <===> USB_HW
+
+        subgraph Kernel ["Linux Kernel Space"]
+            Composite["USB Composite Gadget Core"]
+            F_HID["Hardened f_hid Driver (usb_f_hid_fix.ko)"]
+            CharDev["Character Device Node (/dev/hidg0)"]
+
+            USB_HW <--> Composite
+            Composite <--> F_HID
+            F_HID <--> CharDev
+        end
+
+        subgraph Userspace ["Android Userspace (Termux / Root)"]
+            ConfigFS["ConfigFS (/config/usb_gadget/g1)"]
+            Emulator["Python FIDO2 Emulator (fido_touch_key.py)"]
+            Storage["Passkey Storage (~/.fido_keys/*.json)"]
+
+            ConfigFS -.-> Composite
+            CharDev <===> Emulator
+            Emulator <--> Storage
+        end
+    end
+```
+
+---
+
+## 2. Root Cause Analysis: Upstream `f_hid.c` Panics
+
+Upstream Linux kernel `drivers/usb/gadget/function/f_hid.c` was designed for embedded systems where USB cables are permanently attached or unbinding is rare. On modern Android devices with dynamic USB controllers (like Synopsys DesignWare Core 3 / `dwc3` found in Samsung Exynos, Qualcomm Snapdragon, and MediaTek Dimensity), running stock `f_hid` causes fatal kernel panics.
+
+### Fatal Defect 1: Interrupt Completion NULL Pointer Dereference
+When a USB cable is disconnected, the host resets the bus, or the Android USB HAL switches profiles, the composite gadget core disables functions and unlinks `f->config`. Any pending USB transfer requests in the hardware FIFO are immediately cancelled by the controller with statuses like `-ECONNRESET`, `-ESHUTDOWN`, or `-ECONNABORTED`.
+
+**Upstream Code:**
+```c
+static void hidg_intout_complete(struct usb_ep *ep, struct usb_request *req) {
+    struct f_hidg *hidg = (struct f_hidg *) req->context;
+    struct usb_composite_dev *cdev = hidg->func.config->cdev; // CRASH! hidg->func.config is NULL!
+    ...
+    default:
+        ERROR(cdev, "Set report failed %d\n", req->status); // Kernel Panic
+}
+```
+**Fix:**
+```c
+static void hidg_intout_complete(struct usb_ep *ep, struct usb_request *req) {
+    struct f_hidg *hidg = (struct f_hidg *) req->context;
+    if (!hidg) {
+        free_ep_req(ep, req);
+        return;
+    }
+    // Safely ignore standard disconnect statuses without accessing cdev
+    if (req->status != 0 && req->status != -ESHUTDOWN && req->status != -ECONNRESET) {
+        if (hidg->func.config && hidg->func.config->cdev) {
+            ERROR(hidg->func.config->cdev, "End Point Request ERROR: %d\n", req->status);
+        }
+    }
+    ...
+```
+
+### Fatal Defect 2: Unchecked Char Device File Operations
+If a userspace process (e.g. Python emulator) has `/dev/hidg0` open during disconnect, subsequent `read()`, `write()`, `poll()`, or `release()` calls attempt to dereference stale endpoint structures or call `ERROR(hidg->func.config->cdev, ...)` on disabled configurations.
+
+**Fix:**
+Guard every character device file operation with an immediate check:
+```c
+if (!hidg)
+    return -ESHUTDOWN;
+```
+
+### Fatal Defect 3: Write Queue Deadlock on Cable Disconnect
+In upstream `f_hid.c`, `WRITE_COND` was defined as `(!hidg->write_pending)`.
+When the host pulls the cable or gadget disables, `hidg_disable()` sets `hidg->write_pending = 1` and calls `wake_up_interruptible(&hidg->write_queue)`. Any writer thread waiting in `wait_event_interruptible_exclusive(hidg->write_queue, WRITE_COND)` wakes up, evaluates `WRITE_COND`, sees `!1 == 0` (false), and **falls back asleep indefinitely**, deadlocking the thread and locking the device node.
+
+**Fix:**
+```c
+#define WRITE_COND (!hidg->write_pending || hidg->disabled || !hidg->req)
+...
+while (!WRITE_COND) {
+    spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+    if (file->f_flags & O_NONBLOCK)
+        return -EAGAIN;
+    if (wait_event_interruptible_exclusive(hidg->write_queue, WRITE_COND))
+        return -ERESTARTSYS;
+    spin_lock_irqsave(&hidg->write_spinlock, flags);
+}
+
+if (hidg->disabled || !hidg->req) {
+    spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+    return -ESHUTDOWN; // Exit immediately on disconnect!
+}
+```
+
+### Fatal Defect 4: Idempotent Unbind Sequence
+When unlinking the function from ConfigFS, upstream `hidg_unbind` did not disable active endpoints before deleting character devices.
+
+**Fix:**
+```c
+static void hidg_unbind(struct usb_configuration *c, struct usb_function *f) {
+    struct f_hidg *hidg = func_to_hidg(f);
+    hidg_disable(f); // Flush and disable endpoints cleanly first
+    cdev_device_del(&hidg->cdev, &hidg->dev);
+    usb_free_all_descriptors(f);
+}
+```
+
+---
+
+## 3. How to Build the Hardened Module for ANY Android Device
+
+Android 12+ devices run Google's **Generic Kernel Image (GKI)**. This means the core kernel shares an identical Kernel Module Interface (KMI) across all manufacturers. You do **not** need the full manufacturer kernel source tree; you only need the GKI kernel headers and the matching `Module.symvers`.
+
+### Step 1: Identify Target Kernel & KMI Version
+On the target Android device (via Termux or ADB):
+```bash
+uname -r
+# Example: 5.15.153-android14-11-29497047-abS928BXXU1AXB5
+```
+Here:
+- Kernel major/minor: `5.15`
+- Base commit: `android14-5.15`
+
+### Step 2: Extract Reference `Module.symvers`
+`Module.symvers` contains the exact symbol CRCs (e.g. `module_layout`, `usb_ep_queue`).
+You can obtain it via:
+1. Google AOSP GKI release builds: [android.googlesource.com/kernel/common](https://android.googlesource.com/kernel/common)
+2. Or extract from boot image / `/proc/kallsyms`.
+
+### Step 3: Out-of-Tree Makefile
+Structure an isolated directory (`f_hid_fix/`):
+```makefile
+obj-m := usb_f_hid_fix.o
+usb_f_hid_fix-y := f_hid.o
+
+KDIR ?= /path/to/kernel/out
+PWD := $(shell pwd)
+
+default:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+```
+
+### Step 4: Automated GitHub Actions CI Workflow
+You can compile this without installing gigabytes of Android Clang toolchains locally by using a GitHub Actions runner:
+
+```yaml
+name: Build Hardened f_hid Module
+on: [workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Android Clang
+        run: |
+          mkdir -p clang
+          curl -sSL "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r450784d.tar.gz" | tar -xz -C clang
+
+      - name: Fetch Kernel Headers & Build
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          make -C $KERNEL_OUT M=$(pwd)/f_hid_fix \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 CC=clang LD=ld.lld \
+            modules
+```
+
+---
+
+## 4. Universal ConfigFS USB Gadget Orchestration
+
+Every modern Android device uses the Linux ConfigFS gadget driver at `/config/usb_gadget/g1`.
+
+### Finding the Hardware UDC (USB Device Controller)
+To find the exact controller name on any phone:
+```bash
+ls /sys/class/udc
+# Qualcomm:   a600000.dwc3 (or 4e00000.dwc3)
+# Samsung:    13200000.dwc3 (or 10e00000.dwc3)
+# MediaTek:   11201000.usb0 (or musb-hdrc)
+# Google Tensor: 11110000.dwc3
+```
+
+### Official FIDO CTAPHID Report Descriptor (34 Bytes)
+The USB HID descriptor tells the host OS that this device is a FIDO/U2F security key rather than a keyboard or mouse:
+
+```python
+FIDO_REPORT_DESC = bytes([
+    0x06, 0xD0, 0xF1,  # Usage Page (FIDO Alliance: 0xF1D0)
+    0x09, 0x01,        # Usage (CTAPHID: 0x01)
+    0xA1, 0x01,        # Collection (Application)
+    0x09, 0x20,        #   Usage (Data In)
+    0x15, 0x00,        #   Logical Minimum (0)
+    0x26, 0xFF, 0x00,  #   Logical Maximum (255)
+    0x75, 0x08,        #   Report Size (8 bits)
+    0x95, 0x40,        #   Report Count (64 bytes)
+    0x81, 0x02,        #   Input (Data, Variable, Absolute)
+    0x09, 0x21,        #   Usage (Data Out)
+    0x15, 0x00,        #   Logical Minimum (0)
+    0x26, 0xFF, 0x00,  #   Logical Maximum (255)
+    0x75, 0x08,        #   Report Size (8 bits)
+    0x95, 0x40,        #   Report Count (64 bytes)
+    0x91, 0x02,        #   Output (Data, Variable, Absolute)
+    0xC0               # End Collection
+])
+```
+
+### The Hotplug-Safe Binding Shell Sequence
+ConfigFS rejects modifying configurations (`EBUSY` / `EINVAL`) while the gadget is bound to the UDC. To safely configure without crashing:
+
+```bash
+UDC_NAME=$(ls /sys/class/udc | head -n 1)
+GADGET="/config/usb_gadget/g1"
+FUNC="$GADGET/functions/hid_fix.0"
+CONFIG="$GADGET/configs/b.1"
+
+# 1. Unbind UDC temporarily
+echo "" > $GADGET/UDC
+sleep 0.1
+
+# 2. Configure HID Function
+mkdir -p $FUNC
+echo 0 > $FUNC/subclass
+echo 0 > $FUNC/protocol
+echo 64 > $FUNC/report_length
+# (Write binary FIDO_REPORT_DESC to $FUNC/report_desc)
+
+# 3. Symlink into primary configuration
+ln -s $FUNC $CONFIG/f_hid
+
+# 4. Re-bind to hardware controller
+echo "$UDC_NAME" > $GADGET/UDC
+chmod 666 /dev/hidg*
+```
+
+---
+
+## 5. FIDO2 / WebAuthn & Windows Hello Specifications
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User
+    participant Host as Windows Hello / Chrome
+    participant Script as fido_touch_key.py
+    participant Node as /dev/hidg0 (Kernel)
+
+    Host->>Node: CTAPHID_INIT (0x86)
+    Node->>Script: Read packet (64 bytes)
+    Script->>Node: Assign CID (Channel ID) & Capabilities
+    Node->>Host: 64-byte Init Response
+
+    Note over Host,Script: Windows Hello Probe Check
+    Host->>Node: CTAP2 authenticatorMakeCredential ("SelectDevice")
+    Node->>Script: CBOR Request (rpId: "SelectDevice")
+    Script->>Node: Auto-Ack (0.1s) with UV=1 (0x45)
+    Node->>Host: Authenticator acknowledges presence
+
+    Note over Host,Script: Real Website Registration / Login
+    Host->>Node: authenticatorMakeCredential / GetAssertion
+    Node->>Script: Incoming CBOR request
+    loop User Presence Keepalive
+        Script->>Node: CTAPHID_KEEPALIVE (0xBB, STATUS_UPNEEDED 0x02)
+        Node->>Host: Host displays "Touch your security key"
+    end
+    User->>Script: Press ENTER (Golden Disc Touched)
+    Script->>Node: Generate P-256 ECDSA Signature (UV=1, UP=1)
+    Node->>Host: CTAP2 CBOR Success (0x00)
+    Host->>User: Website Logged In Successfully!
+```
+
+### Critical WebAuthn Gotchas Resolved
+
+| Issue / Symptom | Root Cause | Fix Applied |
+| :--- | :--- | :--- |
+| **"The PIN is incorrect. Try again"** | `authData` flags bit 2 (UV - User Verification) was 0 (`0x41`). Windows expects UV=1 when PIN is requested. | Set `flags = 0x45` (Bit 0 `UP=1`, Bit 2 `UV=1`, Bit 6 `AT=1`). |
+| **Windows stuck searching for key** | Windows sends a dummy credential probe with `rpId: "SelectDevice"` before asking for PIN. If delayed or rejected, Windows aborts. | Automatically acknowledge `SelectDevice` in `< 0.1s` without prompting user. |
+| **CBOR Decoding Failures** | Non-deterministic map key ordering or integer formatting in Python dictionary dumps. | Use canonical RFC 7049 CBOR formatting (`cbor2.dumps(..., canonical=True)`). |
+| **Key format has `\n` in JSON** | Standard PEM private keys contain literal newlines. In JSON, these are escaped as `\n`. | Completely standard. Loaded via `load_pem_private_key()`. |
+
+---
+
+## 6. Reproducing on Other Devices (Step-by-Step)
+
+1. **Kernel Module Storage:**
+   Store `usb_f_hid_fix.ko` in vendor firmware storage:
+   - Modern Android: `/data/vendor/fw/usb_f_hid_fix.ko` or `/data/vendor/firmware/usb_f_hid_fix.ko`
+   - Fallback: `/data/local/tmp/usb_f_hid_fix.ko`
+2. **Permissions:**
+   ```bash
+   chmod 644 /data/vendor/fw/usb_f_hid_fix.ko
+   ```
+3. **Automatic Teardown on Exit:**
+   Ensure your userspace daemon registers an exit hook (`atexit` in Python or `trap ... EXIT` in bash) to unlink `$CONFIG/f_hid`. This guarantees that phone MTP/charging works normally the moment the key application closes.
