@@ -73,7 +73,7 @@ struct f_hidg {
 	struct usb_request		*req;
 
 	struct device			dev;
-	struct cdev			cdev;
+	struct cdev			*cdev;
 	struct usb_function		func;
 
 	struct usb_ep			*in_ep;
@@ -347,12 +347,20 @@ static ssize_t f_hidg_intout_read(struct file *file, char __user *buffer,
 	 * call, taking into account its current read position.
 	 */
 	if (list->pos == req->actual) {
+		struct usb_ep *out_ep = hidg->out_ep;
+
 		kfree(list);
 
+		if (READ_ONCE(hidg->disabled) || !out_ep || !out_ep->enabled) {
+			if (out_ep)
+				free_ep_req(out_ep, req);
+			return -ESHUTDOWN;
+		}
+
 		req->length = hidg->report_length;
-		ret = usb_ep_queue(hidg->out_ep, req, GFP_KERNEL);
+		ret = usb_ep_queue(out_ep, req, GFP_KERNEL);
 		if (ret < 0) {
-			free_ep_req(hidg->out_ep, req);
+			free_ep_req(out_ep, req);
 			return ret;
 		}
 	} else {
@@ -508,8 +516,8 @@ static ssize_t f_hidg_write(struct file *file, const char __user *buffer,
 
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
 
-	/* when our function has been disabled by host */
-	if (!hidg->req || hidg->disabled) {
+	/* when our function has been disabled or reconfigured by host */
+	if (!hidg->req || hidg->disabled || hidg->req != req) {
 		if (hidg->in_ep)
 			free_ep_req(hidg->in_ep, req);
 		spin_unlock_irqrestore(&hidg->write_spinlock, flags);
@@ -538,7 +546,12 @@ static ssize_t f_hidg_write(struct file *file, const char __user *buffer,
 	return status;
 release_write_pending:
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
-	hidg->write_pending = 0;
+	if (hidg->req != req) {
+		if (hidg->in_ep)
+			free_ep_req(hidg->in_ep, req);
+	} else {
+		hidg->write_pending = 0;
+	}
 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
 
 	wake_up(&hidg->write_queue);
@@ -591,9 +604,13 @@ static int f_hidg_release(struct inode *inode, struct file *fd)
 
 static int f_hidg_open(struct inode *inode, struct file *fd)
 {
-	struct f_hidg *hidg =
-		container_of(inode->i_cdev, struct f_hidg, cdev);
+	struct f_hidg *hidg;
 
+	if (!inode->i_cdev || !inode->i_cdev->kobj.parent)
+		return -ENODEV;
+
+	hidg = container_of(inode->i_cdev->kobj.parent,
+			    struct f_hidg, dev.kobj);
 	fd->private_data = hidg;
 
 	return 0;
@@ -856,7 +873,15 @@ static int hidg_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 
 	if (hidg->in_ep != NULL) {
 		/* restart endpoint */
-		usb_ep_disable(hidg->in_ep);
+		if (hidg->in_ep->enabled)
+			usb_ep_disable(hidg->in_ep);
+
+		spin_lock_irqsave(&hidg->write_spinlock, flags);
+		if (hidg->req && !hidg->write_pending)
+			free_ep_req(hidg->in_ep, hidg->req);
+		hidg->req = NULL;
+		hidg->write_pending = 1;
+		spin_unlock_irqrestore(&hidg->write_spinlock, flags);
 
 		status = config_ep_by_speed(f->config->cdev->gadget, f,
 					    hidg->in_ep);
@@ -1048,18 +1073,11 @@ static int hidg_bind(struct usb_configuration *c, struct usb_function *f)
 	hidg->write_pending = 1;
 	hidg->req = NULL;
 
-	/* create char device */
-	cdev_init(&hidg->cdev, &f_hidg_fops);
-	status = cdev_device_add(&hidg->cdev, &hidg->dev);
-	if (status)
-		goto fail_free_descs;
-
 	return 0;
-fail_free_descs:
-	usb_free_all_descriptors(f);
 fail:
-	ERROR(f->config->cdev, "hidg_bind FAILED\n");
-	if (hidg->req != NULL)
+	if (c && c->cdev)
+		ERROR(c->cdev, "hidg_bind FAILED\n");
+	if (hidg->req != NULL && hidg->in_ep)
 		free_ep_req(hidg->in_ep, hidg->req);
 
 	return status;
@@ -1285,6 +1303,11 @@ static void hidg_free(struct usb_function *f)
 
 	hidg = func_to_hidg(f);
 	opts = container_of(f->fi, struct f_hid_opts, func_inst);
+	hidg_disable(f);
+	if (hidg->cdev) {
+		cdev_device_del(hidg->cdev, &hidg->dev);
+		hidg->cdev = NULL;
+	}
 	put_device(&hidg->dev);
 	mutex_lock(&opts->lock);
 	--opts->refcnt;
@@ -1293,11 +1316,7 @@ static void hidg_free(struct usb_function *f)
 
 static void hidg_unbind(struct usb_configuration *c, struct usb_function *f)
 {
-	struct f_hidg *hidg = func_to_hidg(f);
-
 	hidg_disable(f);
-	cdev_device_del(&hidg->cdev, &hidg->dev);
-
 	usb_free_all_descriptors(f);
 }
 
@@ -1323,6 +1342,7 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 	init_waitqueue_head(&hidg->read_queue);
 	INIT_LIST_HEAD(&hidg->completed_out_req);
 	hidg->disabled = true;
+	hidg->write_pending = 1;
 
 	device_initialize(&hidg->dev);
 	hidg->dev.release = hidg_release;
@@ -1330,6 +1350,7 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 	hidg->dev.devt = MKDEV(major, opts->minor);
 	ret = dev_set_name(&hidg->dev, "hidg%d", opts->minor);
 	if (ret) {
+		put_device(&hidg->dev);
 		--opts->refcnt;
 		mutex_unlock(&opts->lock);
 		return ERR_PTR(ret);
@@ -1365,12 +1386,52 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 	/* this could be made configurable at some point */
 	hidg->qlen	   = 4;
 
+	/*
+	 * Create char device once over the lifetime of hidg instance so
+	 * ConfigFS UDC unbind/rebind cycles (e.g. adbd/USB suspend) never
+	 * re-init or orphan open cdevs (CVE-2026-31606).
+	 */
+	hidg->cdev = cdev_alloc();
+	if (!hidg->cdev) {
+		ret = -ENOMEM;
+		goto err_put_dev;
+	}
+	hidg->cdev->ops = &f_hidg_fops;
+	hidg->cdev->owner = THIS_MODULE;
+
+	cdev_set_parent(hidg->cdev, &hidg->dev.kobj);
+	ret = cdev_add(hidg->cdev, hidg->dev.devt, 1);
+	if (ret) {
+		hidg->cdev->kobj.parent = NULL;
+		kobject_put(&hidg->cdev->kobj);
+		hidg->cdev = NULL;
+		goto err_put_dev;
+	}
+
+	ret = device_add(&hidg->dev);
+	if (ret) {
+		cdev_del(hidg->cdev);
+		hidg->cdev = NULL;
+		goto err_put_dev;
+	}
+
 	return &hidg->func;
+
+err_put_dev:
+	put_device(&hidg->dev);
+	mutex_lock(&opts->lock);
+	--opts->refcnt;
+	mutex_unlock(&opts->lock);
+	return ERR_PTR(ret);
 }
 
 DECLARE_USB_FUNCTION(hid_fix, hidg_alloc_inst, hidg_alloc);
 DECLARE_USB_FUNCTION(f_hid, hidg_alloc_inst, hidg_alloc);
 DECLARE_USB_FUNCTION(hid, hidg_alloc_inst, hidg_alloc);
+
+static bool reg_hid_fix;
+static bool reg_f_hid;
+static bool reg_hid;
 
 static int __init hidg_modinit(void)
 {
@@ -1379,12 +1440,23 @@ static int __init hidg_modinit(void)
 	ret = usb_function_register(&hid_fixusb_func);
 	if (ret)
 		pr_warn("f_hid_fix: failed to register hid_fix function: %d\n", ret);
+	else
+		reg_hid_fix = true;
 
 	/* Also register f_hid alias */
-	usb_function_register(&f_hidusb_func);
+	ret = usb_function_register(&f_hidusb_func);
+	if (!ret)
+		reg_f_hid = true;
 
 	/* Also register hid if available */
-	usb_function_register(&hidusb_func);
+	ret = usb_function_register(&hidusb_func);
+	if (!ret)
+		reg_hid = true;
+
+	if (!reg_hid_fix && !reg_f_hid && !reg_hid) {
+		pr_err("f_hid_fix: failed to register any HID function\n");
+		return -EEXIST;
+	}
 
 	pr_info("f_hid_fix: patched USB HID gadget function driver loaded\n");
 	return 0;
@@ -1392,9 +1464,12 @@ static int __init hidg_modinit(void)
 
 static void __exit hidg_modexit(void)
 {
-	usb_function_unregister(&hidusb_func);
-	usb_function_unregister(&f_hidusb_func);
-	usb_function_unregister(&hid_fixusb_func);
+	if (reg_hid)
+		usb_function_unregister(&hidusb_func);
+	if (reg_f_hid)
+		usb_function_unregister(&f_hidusb_func);
+	if (reg_hid_fix)
+		usb_function_unregister(&hid_fixusb_func);
 }
 
 module_init(hidg_modinit);
