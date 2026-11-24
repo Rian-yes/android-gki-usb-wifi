@@ -315,5 +315,27 @@ sequenceDiagram
    ```bash
    chmod 644 /data/vendor/fw/usb_f_hid_fix.ko
    ```
-3. **Automatic Teardown on Exit:**
-   Ensure your userspace daemon registers an exit hook (`atexit` in Python or `trap ... EXIT` in bash) to unlink `$CONFIG/f_hid`. This guarantees that phone MTP/charging works normally the moment the key application closes.
+3. **Module Loading:**
+   ```bash
+   insmod /data/vendor/fw/usb_f_hid_fix.ko
+   ```
+
+---
+
+## 7. Android USB HAL Watchdog & Process Lifecycle Architecture
+
+A critical discovery made during real-world hardware testing is the interaction between userspace process lifecycles and the Android USB Hardware Abstraction Layer (`vendor.samsung.hardware.usb-service` or AOSP `android.hardware.usb-service`).
+
+### The `pkill` / UDC Race Condition Crash
+If a userspace script unbinds UDC (`echo "" > /config/usb_gadget/g1/UDC`) during teardown, and the process is killed abruptly (via `pkill`, `SIGKILL`, or terminal disconnect) while UDC is detached:
+1. The hardware USB DWC3 controller remains unlinked while Android framework properties (`sys.usb.config=mtp,adb`) expect active endpoints.
+2. Active FunctionFS daemons (`adbd`, `mtp`) desynchronize and hang waiting for ep0 state recovery.
+3. The Samsung / Android USB HAL watchdog detects that the hardware controller was detached behind its back without a property change, triggers a kernel restart timeout (`SEC_REBOOT` / `Kernel Restart: USB HAL Watchdog`), and reboots the phone.
+
+### The Architectural Rule: Decouple Userspace from Hardware UDC State
+Real hardware security keys (like YubiKeys) do not plug and unplug their USB controller when applications open or close. The USB HID interface remains statically presented to the host USB bus.
+
+1. **Static Peripheral Binding:** Link `f_hid` into `/config/usb_gadget/g1/configs/b.1/f_hid` **once** when starting the key service. Leave it attached so the host sees a continuous, stable FIDO2 composite interface.
+2. **Userspace Connection via File Descriptor:** The Python emulator simply opens `/dev/hidg0` when running, and closes `/dev/hidg0` when stopped.
+3. **Driver Hardening Guarantees Safety:** Because `usb_f_hid_fix.ko` safely handles disconnects and queues without deadlocking, `/dev/hidg0` can be opened and closed repeatedly, or the USB cable can be pulled and replugged at any moment, without touching UDC.
+4. **Manual Unbind Only:** Only unbind UDC and remove `f_hid` when the user explicitly requests to completely decommission the security key profile (e.g. Option 6 `--unbind`). Never perform hardware UDC toggles on routine script exit or crash handlers.
