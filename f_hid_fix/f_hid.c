@@ -471,7 +471,6 @@ static ssize_t f_hidg_write(struct file *file, const char __user *buffer,
 	}
 
 #define WRITE_COND (!hidg->write_pending || hidg->disabled || !hidg->req)
-try_again:
 	/* write queue */
 	while (!WRITE_COND) {
 		spin_unlock_irqrestore(&hidg->write_spinlock, flags);
@@ -654,9 +653,6 @@ static void hidg_ssreport_complete(struct usb_ep *ep, struct usb_request *req)
 
 	if (!hidg || req->status != 0 || req->buf == NULL || req->actual == 0)
 		return;
-		      __func__, req->status, req->buf, req->actual);
-		return;
-	}
 
 	spin_lock_irqsave(&hidg->read_spinlock, flags);
 
