@@ -97,7 +97,10 @@ jobs:
           path: |
             ks
             clang
-          key: gki-kernel-${{ github.event.inputs.kcommit }}-${{ github.event.inputs.clang_ver }}-${{ github.event.inputs.lto }}-${{ github.event.inputs.btf }}-hid1
+          key: gki-kernel-${{ github.event.inputs.kcommit }}-${{ github.event.inputs.clang_ver }}-${{ github.event.inputs.lto }}-${{ github.event.inputs.btf }}-bt1
+          restore-keys: |
+            gki-kernel-${{ github.event.inputs.kcommit }}-${{ github.event.inputs.clang_ver }}-
+            gki-kernel-${{ github.event.inputs.kcommit }}-
 
       - name: Fetch kernel source (exact commit)
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -199,14 +202,22 @@ jobs:
 
       - name: Stage reference Module.symvers for exact KMI matching
         run: |
-          if [ -f "$GITHUB_WORKSPACE/ref_modules/Module.symvers" ]; then
-            echo "Staging reference Module.symvers into ks/out/..."
-            cp "$GITHUB_WORKSPACE/ref_modules/Module.symvers" "$GITHUB_WORKSPACE/ks/out/Module.symvers"
-            cp "$GITHUB_WORKSPACE/ref_modules/Module.symvers" "$GITHUB_WORKSPACE/ks/Module.symvers"
+          mkdir -p ks/out
+          if [ -f "f_hid_fix/Module.symvers" ]; then
+            echo "Staging f_hid_fix/Module.symvers into ks/out/..."
+            cp f_hid_fix/Module.symvers ks/out/Module.symvers
+            cp f_hid_fix/Module.symvers ks/Module.symvers
+          elif [ -f "ref_modules/Module.symvers" ]; then
+            echo "Staging ref_modules/Module.symvers into ks/out/..."
+            cp ref_modules/Module.symvers ks/out/Module.symvers
+            cp ref_modules/Module.symvers ks/Module.symvers
           fi
-          if [ -f "$GITHUB_WORKSPACE/ks/out/Module.symvers" ]; then
+          if [ -f "ks/out/Module.symvers" ]; then
             echo "=== Verified Module.symvers in ks/out/ ==="
-            grep -w module_layout "$GITHUB_WORKSPACE/ks/out/Module.symvers" || true
+            grep -w module_layout ks/out/Module.symvers || true
+          else
+            echo "::error::Module.symvers not found in ks/out/!"
+            exit 1
           fi
 
       - name: Build Patched USB HID Gadget Modules
