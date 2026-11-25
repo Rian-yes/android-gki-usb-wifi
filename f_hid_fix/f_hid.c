@@ -1399,18 +1399,8 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 	hidg->cdev->ops = &f_hidg_fops;
 	hidg->cdev->owner = THIS_MODULE;
 
-	cdev_set_parent(hidg->cdev, &hidg->dev.kobj);
-	ret = cdev_add(hidg->cdev, hidg->dev.devt, 1);
+	ret = cdev_device_add(hidg->cdev, &hidg->dev);
 	if (ret) {
-		hidg->cdev->kobj.parent = NULL;
-		kobject_put(&hidg->cdev->kobj);
-		hidg->cdev = NULL;
-		goto err_put_dev;
-	}
-
-	ret = device_add(&hidg->dev);
-	if (ret) {
-		cdev_del(hidg->cdev);
 		hidg->cdev = NULL;
 		goto err_put_dev;
 	}
