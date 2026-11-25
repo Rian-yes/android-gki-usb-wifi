@@ -339,3 +339,32 @@ Real hardware security keys (like YubiKeys) do not plug and unplug their USB con
 2. **Userspace Connection via File Descriptor:** The Python emulator simply opens `/dev/hidg0` when running, and closes `/dev/hidg0` when stopped.
 3. **Driver Hardening Guarantees Safety:** Because `usb_f_hid_fix.ko` safely handles disconnects and queues without deadlocking, `/dev/hidg0` can be opened and closed repeatedly, or the USB cable can be pulled and replugged at any moment, without touching UDC.
 4. **Manual Unbind Only:** Only unbind UDC and remove `f_hid` when the user explicitly requests to completely decommission the security key profile (e.g. Option 6 `--unbind`). Never perform hardware UDC toggles on routine script exit or crash handlers.
+
+---
+
+## 8. CVE-2026-31606 `cdev` Lifecycle, Module Exit & Userspace Poll Hardening
+
+### Root Cause: UDC Rebind While `/dev/hidg0` Is Open
+On Android devices with USB gadget monitors (for example Samsung `ss_mon.mtp` / `init.s5e8835.usb.rc` or `adbd` restarts), **USB selective suspend** (`USB_STATE=DISCONNECTED`) can trigger an automatic in-place ConfigFS UDC unbind and rebind (`hidg_unbind` followed milliseconds later by `hidg_bind`) **without unplugging the cable or closing userspace**.
+
+In stock `f_hid.c`:
+- `hidg_unbind()` called `cdev_device_del(&hidg->cdev, &hidg->dev)`.
+- `hidg_bind()` called `cdev_init(&hidg->cdev, &f_hidg_fops)` and `cdev_device_add(&hidg->cdev, &hidg->dev)`.
+- Calling `cdev_init()` on the same `struct f_hidg` while `/dev/hidg0` was still open in userspace `memset`-zeroed `cdev`, reset `cdev.kobj` refcounts, and re-initialized `cdev->list` while `inode->i_devices` remained linked on it—causing `cdev_put` refcount underflow (`use-after-free`) and `cd_forget()` `list_del corruption` kernel panics when the process later exited (`Ctrl+C` / `close()`), as well as leaving `/dev/hidg0` orphaned.
+
+### Kernel & Userspace Fixes Applied
+1. **Single-Lifetime `cdev_alloc` (`f_hid_fix/f_hid.c`):**
+   - Moved `cdev_alloc()` + `cdev_device_add(hidg->cdev, &hidg->dev)` into `hidg_alloc()` and `cdev_device_del(hidg->cdev, &hidg->dev)` into `hidg_free()`. (Uses KMI-exported `cdev_alloc` and `cdev_device_add` directly, since `cdev_set_parent` is not exported in the GKI 5.15 KMI.)
+   - `hidg_unbind()` now only calls `hidg_disable(f)` and `usb_free_all_descriptors(f)`, keeping `/dev/hidg0` and its `cdev` intact across UDC unbind/rebind cycles.
+   - `f_hidg_open()` retrieves `hidg` via `container_of(inode->i_cdev->kobj.parent, struct f_hidg, dev.kobj)`.
+2. **Request & Queue Guards (`f_hid_fix/f_hid.c`):**
+   - Guarded `f_hidg_intout_read()` endpoint requeue against `disabled` / `!out_ep->enabled`, guarded `f_hidg_write()` (`hidg->req != req`), and freed stale `hidg->req` in `hidg_set_alt()`.
+3. **Safe `rmmod` Unregistration (`f_hid_fix/f_hid.c`):**
+   - Tracked `reg_hid_fix`, `reg_f_hid`, and `reg_hid` in `hidg_modinit()` / `hidg_modexit()` so `hidg_modexit()` never calls `usb_function_unregister()` on an alias whose registration returned `-EEXIST`.
+4. **Non-Blocking Userspace I/O & CTAPHID Fixes (`fido_touch_key.py`):**
+   - Polled `/dev/hidg0` with `select.select()` (`0.5s` read loop, `1.5s` `_safe_write_pkt()` write timeout) so stalled host IN polling cannot freeze Python.
+   - Normalized `OSError` handling (`"shutdown" in str(e).lower()` and `errno in (5, 19, 32, 108)`) to survive UDC suspend/reset cleanly.
+   - Allocated incrementing `next_cid` on `CTAPHID_INIT` (`0x86`) broadcast `0xFFFFFFFF`, handled `CTAPHID_CANCEL` (`0x91`), and returned `CTAPHID_ERROR` (`0xBF`) on unknown commands.
+
+### Verification Summary (Galaxy A35 `SM-A356E`)
+- Verified `usb_f_hid_fix.ko` loads cleanly (`insmod`), stays alive across an in-place ConfigFS UDC unbind/rebind while `fido_touch_key.py` holds `/dev/hidg0` open, exits cleanly on `SIGINT` with zero `dmesg` errors (`refcount`, `list_del`, `cd_forget`, `cdev_put`, `Oops`, `BUG`), and unloads/reloads cleanly via `rmmod` + `insmod`.
