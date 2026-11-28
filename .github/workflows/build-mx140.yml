@@ -189,12 +189,20 @@ jobs:
           export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
           cd src/drivers/net/wireless/scsc
 
+          echo "Injecting vendor scsc_mx symbol CRCs for SM-A356E..."
+          printf '%s\n' \
+            '0x9b0b1b34	scsc_service_register_check_bt_status_cb	scsc_mx	EXPORT_SYMBOL	' \
+            '0xe3a68026	scsc_service_unregister_check_bt_status_cb	scsc_mx	EXPORT_SYMBOL	' \
+            '0x1ae2a520	scsc_mx_service_mifram_free	scsc_mx	EXPORT_SYMBOL	' \
+            '0x656e91a1	mxman_recovery_disabled	scsc_mx	EXPORT_SYMBOL	' \
+            > "$GITHUB_WORKSPACE/scsc_mx.symvers"
+
           echo "Building scsc_wlan.ko against prepared kernel..."
           make -j$(nproc) -C "$GITHUB_WORKSPACE/ks/out" M="$(pwd)" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 CC=clang LD=ld.lld \
-            KBUILD_MODPOST_WARN=1 \
+            KBUILD_EXTRA_SYMBOLS="$GITHUB_WORKSPACE/scsc_mx.symvers" \
             modules
 
           if [ ! -f "scsc_wlan.ko" ]; then
